@@ -2,6 +2,14 @@
 
 import csv
 import io
+import json
+import os
+import shutil
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import streamlit as st
 
@@ -12,7 +20,7 @@ st.set_page_config(page_title="Play Integrity Analyzer", page_icon="🔍", layou
 st.title("Play Integrity Analyzer")
 st.caption("Detect Google Play Integrity API and Auto Protection (pairip) in Android APKs to assess sideloading risk.")
 
-tab_single, tab_batch = st.tabs(["Single APK Analysis", "Batch Analysis"])
+tab_single, tab_batch, tab_sideload = st.tabs(["Single APK Analysis", "Batch Analysis", "Sideload Test"])
 
 
 def _risk_badge(risk_level):
@@ -137,3 +145,283 @@ with tab_batch:
         for r in results:
             with st.expander(f"{r.file_name} — {r.risk_level.value}"):
                 _render_result(r)
+
+
+# ---------------------------------------------------------------------------
+# Sideload Test Tab
+# ---------------------------------------------------------------------------
+
+def _ensure_adb_and_device():
+    """Ensure ADB is available (auto-download if needed) and check for device.
+
+    Returns (adb_ready, device_connected, message, serial).
+    """
+    from adb_provisioner import ensure_adb, check_device
+
+    # Step 1: Ensure ADB binary exists
+    try:
+        adb_path = ensure_adb()
+    except RuntimeError as e:
+        return False, False, str(e), None
+
+    # Step 2: Check for connected device
+    try:
+        _, serial = check_device()
+        return True, True, serial, serial
+    except RuntimeError as e:
+        return True, False, str(e), None
+
+
+def _verdict_badge(verdict):
+    """Return a styled badge for PASS/FAIL/REVIEW verdict."""
+    colors = {"PASS": "#28a745", "FAIL": "#dc3545", "REVIEW": "#ffc107"}
+    text_colors = {"PASS": "#FFFFFF", "FAIL": "#FFFFFF", "REVIEW": "#000000"}
+    color = colors.get(verdict, "#6c757d")
+    text_color = text_colors.get(verdict, "#FFFFFF")
+    return (
+        f'<span style="background-color:{color};color:{text_color};'
+        f'padding:6px 18px;border-radius:6px;font-weight:bold;font-size:1.3em;">'
+        f'{verdict}</span>'
+    )
+
+
+def _run_sideload_test(apk_path, timeout, screenshots_dir, serial):
+    """Run sideload test for a single APK using the sideload_test module."""
+    import sideload_test as st_mod
+
+    result = st_mod.test_single_apk(apk_path, timeout, screenshots_dir, serial=serial)
+    return result
+
+
+def _render_sideload_result(result):
+    """Render a single sideload test result."""
+    verdict = result.get("verdict", "FAIL")
+
+    st.markdown("---")
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.markdown(_verdict_badge(verdict), unsafe_allow_html=True)
+    with col2:
+        pkg = result.get("package_name", "Unknown")
+        app_name = result.get("app_name") or pkg
+        st.markdown(f"**App:** {app_name}")
+        st.markdown(f"**Package:** `{pkg}`")
+        if result.get("version"):
+            st.markdown(f"**Version:** {result['version']}")
+        st.markdown(f"**Install:** {result.get('install_result', 'N/A')}")
+    st.markdown("---")
+
+    st.markdown(f"**Verdict Reason:** {result.get('verdict_reason', 'N/A')}")
+    st.markdown(f"**Duration:** {result.get('duration_seconds', 0)}s")
+
+    signals = result.get("signals", {})
+
+    # Foreground changes
+    fg_changes = signals.get("foreground_changes", [])
+    if fg_changes:
+        with st.expander(f"🔄 Foreground Activity Changes ({len(fg_changes)})"):
+            for change in fg_changes:
+                st.markdown(f"- **T+{change['time']}s:** `{change['activity']}`")
+
+    # Keyword matches
+    kw_matches = signals.get("keyword_matches", [])
+    if kw_matches:
+        tier1 = [m for m in kw_matches if m.get("tier") == 1]
+        tier2 = [m for m in kw_matches if m.get("tier") == 2]
+        if tier1:
+            with st.expander(f"🔴 Tier 1 — Hard Block Signals ({len(tier1)})", expanded=True):
+                for m in tier1:
+                    st.markdown(f"- **T+{m['time']}s:** \"{m['text']}\" (`{m['node_class']}`)")
+        if tier2:
+            with st.expander(f"⚠️ Tier 2 — Soft Signals ({len(tier2)})"):
+                for m in tier2:
+                    st.markdown(f"- **T+{m['time']}s:** \"{m['text']}\" (`{m['node_class']}`)")
+
+    # Logcat signals
+    logcat = signals.get("logcat_signals", [])
+    if logcat:
+        with st.expander(f"📋 Logcat Signals ({len(logcat)})"):
+            st.code("\n".join(logcat[:50]), language="text")
+
+    # Screenshots
+    screenshots = signals.get("screenshots", [])
+    if screenshots:
+        with st.expander(f"📸 Screenshots ({len(screenshots)})"):
+            cols = st.columns(min(len(screenshots), 3))
+            for idx, ss_path in enumerate(screenshots):
+                if os.path.exists(ss_path):
+                    cols[idx % 3].image(ss_path, caption=os.path.basename(ss_path))
+
+
+with tab_sideload:
+    st.subheader("Runtime Sideload Test")
+    st.caption(
+        "Install APKs on a connected Android device, launch them, "
+        "and detect anti-sideload mechanisms (Play Auto Protect, licensing checks, integrity gates)."
+    )
+
+    # Setup guidance for non-technical users
+    with st.expander("📱 Setup Guide (first time only)", expanded=False):
+        st.markdown("""
+**What you need:** An Android phone/tablet connected to this computer via USB cable.
+
+**One-time phone setup:**
+1. On your Android device, go to **Settings → About Phone**
+2. Tap **Build Number** 7 times (this enables Developer Options)
+3. Go back to **Settings → Developer Options**
+4. Enable **USB Debugging**
+5. Connect your phone via USB cable
+6. When prompted on the phone, tap **Allow USB Debugging**
+
+**That's it!** ADB (the tool that talks to your phone) will be downloaded automatically — no manual install needed.
+
+*If using an emulator (Android Studio), just make sure it's running.*
+        """)
+
+    # Check prerequisites with auto-provisioning
+    adb_ready, device_connected, message, serial = _ensure_adb_and_device()
+
+    if not adb_ready:
+        st.error(f"Failed to set up ADB: {message}")
+        st.info("Try refreshing the page. If the problem persists, check your internet connection.")
+    elif not device_connected:
+        st.warning("⚠️ No Android device detected.")
+        st.info(
+            "Make sure your phone is:\n"
+            "- Connected via USB cable\n"
+            "- USB Debugging is enabled (see Setup Guide above)\n"
+            "- You tapped 'Allow' on the USB debugging prompt on your phone\n\n"
+            "Then **refresh this page**."
+        )
+        if st.button("🔄 Check Again", key="recheck_device"):
+            st.rerun()
+    else:
+        st.success(f"✅ Device connected: `{serial}`")
+
+        from adb_provisioner import get_device_model as _get_model
+        device_model = _get_model(serial)
+        st.markdown(f"**Device:** {device_model}")
+
+        import sideload_test as st_mod
+
+        # Upload APKs
+        sideload_files = st.file_uploader(
+            "Upload APK file(s) to sideload test",
+            type=["apk"],
+            accept_multiple_files=True,
+            key="sideload_upload",
+        )
+
+        col_timeout, col_dir = st.columns(2)
+        with col_timeout:
+            timeout_val = st.number_input(
+                "Monitor timeout (seconds)", min_value=5, max_value=120, value=30, key="sideload_timeout"
+            )
+        with col_dir:
+            screenshots_dir = st.text_input(
+                "Screenshots directory", value="./screenshots", key="sideload_ss_dir"
+            )
+
+        if sideload_files:
+            st.write(f"**{len(sideload_files)} APK(s) selected**")
+
+            if st.button("Run Sideload Test", key="run_sideload", type="primary"):
+                all_results = []
+                progress = st.progress(0)
+
+                for i, uploaded in enumerate(sideload_files):
+                    status_container = st.status(f"Testing: {uploaded.name}", expanded=True)
+                    with status_container:
+                        # Save uploaded file to temp location
+                        with tempfile.NamedTemporaryFile(suffix=".apk", delete=False) as tmp:
+                            tmp.write(uploaded.read())
+                            tmp_path = tmp.name
+
+                        try:
+                            # Extract info first for display
+                            info = st_mod.extract_apk_info(tmp_path)
+                            display_name = info["app_label"] or info["package_name"] or uploaded.name
+                            st.write(f"**App:** {display_name}")
+                            if info["package_name"]:
+                                st.write(f"**Package:** `{info['package_name']}`")
+
+                            st.write("⏳ Running sideload test...")
+                            result = _run_sideload_test(
+                                tmp_path, timeout_val, screenshots_dir, serial
+                            )
+                            result["apk_file"] = uploaded.name
+                            all_results.append(result)
+
+                            verdict = result.get("verdict", "FAIL")
+                            if verdict == "PASS":
+                                st.write(f"✅ **PASS:** {result.get('verdict_reason', '')}")
+                            elif verdict == "FAIL":
+                                st.write(f"❌ **FAIL:** {result.get('verdict_reason', '')}")
+                            else:
+                                st.write(f"⚠️ **REVIEW:** {result.get('verdict_reason', '')}")
+                        finally:
+                            os.unlink(tmp_path)
+
+                    progress.progress((i + 1) / len(sideload_files))
+
+                st.session_state["sideload_results"] = all_results
+
+        if "sideload_results" in st.session_state:
+            results = st.session_state["sideload_results"]
+
+            # Summary
+            st.subheader("Results Summary")
+            pass_count = sum(1 for r in results if r.get("verdict") == "PASS")
+            fail_count = sum(1 for r in results if r.get("verdict") == "FAIL")
+            review_count = sum(1 for r in results if r.get("verdict") == "REVIEW")
+
+            col_p, col_f, col_r = st.columns(3)
+            col_p.metric("PASS", pass_count)
+            col_f.metric("FAIL", fail_count)
+            col_r.metric("REVIEW", review_count)
+
+            # Summary table
+            summary_data = [
+                {
+                    "APK": r.get("apk_file", ""),
+                    "Package": r.get("package_name", ""),
+                    "App Name": r.get("app_name", ""),
+                    "Verdict": r.get("verdict", ""),
+                    "Reason": (r.get("verdict_reason", "")[:80] + "...") if len(r.get("verdict_reason", "")) > 80 else r.get("verdict_reason", ""),
+                    "Duration (s)": r.get("duration_seconds", 0),
+                }
+                for r in results
+            ]
+            st.dataframe(summary_data, use_container_width=True)
+
+            # Detailed results
+            st.subheader("Detailed Results")
+            for r in results:
+                verdict = r.get("verdict", "FAIL")
+                icon = {"PASS": "✅", "FAIL": "❌", "REVIEW": "⚠️"}.get(verdict, "❓")
+                label = f"{icon} {r.get('apk_file', 'Unknown')} — {verdict}"
+                with st.expander(label, expanded=(verdict != "PASS")):
+                    _render_sideload_result(r)
+
+            # Download JSON report
+            report = {
+                "test_run": {
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "device": device_model,
+                    "adb_serial": serial,
+                    "tool_version": st_mod.TOOL_VERSION,
+                },
+                "results": results,
+                "summary": {
+                    "total": len(results),
+                    "pass": pass_count,
+                    "fail": fail_count,
+                    "review": review_count,
+                },
+            }
+            st.download_button(
+                "Download JSON Report",
+                json.dumps(report, indent=2),
+                file_name="sideload_report.json",
+                mime="application/json",
+            )

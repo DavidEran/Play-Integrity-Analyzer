@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+.android-tools/
+screenshots/
+sideload_report.json

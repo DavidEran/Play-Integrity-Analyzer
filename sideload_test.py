@@ -33,6 +33,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+from adb_provisioner import ensure_adb, get_aapt2_path
+
 TOOL_VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
@@ -104,9 +106,26 @@ KNOWN_LAUNCHERS = {
 # ---------------------------------------------------------------------------
 
 
+def _get_adb_path():
+    """Get ADB binary path, auto-downloading if needed."""
+    try:
+        return ensure_adb(progress_callback=lambda msg: print(f"  {msg}"))
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+
+# Module-level cached ADB path (resolved on first use)
+_adb_path_cache = None
+
+
 def _adb_cmd(args, serial=None, timeout=30):
     """Run an ADB command and return (returncode, stdout, stderr)."""
-    cmd = ["adb"]
+    global _adb_path_cache
+    if _adb_path_cache is None:
+        _adb_path_cache = _get_adb_path()
+
+    cmd = [_adb_path_cache]
     if serial:
         cmd += ["-s", serial]
     cmd += args
@@ -118,7 +137,7 @@ def _adb_cmd(args, serial=None, timeout=30):
     except subprocess.TimeoutExpired:
         return -1, "", "ADB command timed out"
     except FileNotFoundError:
-        print("ERROR: adb not found on PATH. Install Android SDK platform-tools.")
+        print(f"ERROR: ADB binary not found at {_adb_path_cache}")
         sys.exit(1)
 
 
@@ -174,10 +193,17 @@ def extract_apk_info(apk_path):
         "version_code": None,
     }
 
-    # Try aapt2 first, then aapt
-    for tool in ["aapt2", "aapt"]:
-        if not shutil.which(tool):
-            continue
+    # Try provisioned aapt2/aapt first, then system PATH
+    tools_to_try = []
+    provisioned = get_aapt2_path()
+    if provisioned:
+        tools_to_try.append(provisioned)
+    for t in ["aapt2", "aapt"]:
+        p = shutil.which(t)
+        if p and p not in tools_to_try:
+            tools_to_try.append(p)
+
+    for tool in tools_to_try:
         try:
             cmd = [tool, "dump", "badging", str(apk_path)]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
