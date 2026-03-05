@@ -9,7 +9,6 @@ class RiskLevel(Enum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
-    INFO = "INFO"
     NONE = "NONE"
 
 
@@ -18,7 +17,6 @@ RISK_COLORS = {
     RiskLevel.HIGH: "#DC3545",
     RiskLevel.MEDIUM: "#FD7E14",
     RiskLevel.LOW: "#FFC107",
-    RiskLevel.INFO: "#17A2B8",
     RiskLevel.NONE: "#28A745",
 }
 
@@ -39,10 +37,6 @@ RISK_DESCRIPTIONS = {
     RiskLevel.LOW: (
         "Play Integrity library is bundled but no active enforcement detected "
         "in client code. May use server-side checking or may not enforce at all."
-    ),
-    RiskLevel.INFO: (
-        "Uses Play Asset Delivery. Sideloaded installs may fail to download "
-        "on-demand assets, causing crashes or missing content."
     ),
     RiskLevel.NONE: (
         "No integrity enforcement detected. Sideloading should work normally."
@@ -68,10 +62,6 @@ RISK_RECOMMENDATIONS = {
         "Library is present but likely inactive on the client side. Monitor for updates "
         "that may activate enforcement. Consider verifying with a test sideload."
     ),
-    RiskLevel.INFO: (
-        "Ensure that on-demand asset packs are available or bundled in the sideloaded APK. "
-        "Consider using a universal APK that includes all assets."
-    ),
     RiskLevel.NONE: (
         "No action needed. App should sideload and run normally."
     ),
@@ -89,7 +79,6 @@ if (appLicensingVerdict.equals("LICENSED") ||
 
 @dataclass
 class Finding:
-    """A single detection finding."""
     category: str
     source_file: str
     pattern_matched: str
@@ -98,7 +87,6 @@ class Finding:
 
 @dataclass
 class LayerResult:
-    """Results for a single detection layer."""
     name: str
     detected: bool = False
     findings: list[Finding] = field(default_factory=list)
@@ -107,7 +95,6 @@ class LayerResult:
 
 @dataclass
 class AnalysisResult:
-    """Complete analysis result for an APK."""
     package_name: str = "Unknown"
     file_name: str = ""
     file_size_mb: float = 0.0
@@ -117,7 +104,6 @@ class AnalysisResult:
     play_integrity: LayerResult = field(default_factory=lambda: LayerResult("Play Integrity API"))
     firebase_appcheck: LayerResult = field(default_factory=lambda: LayerResult("Firebase App Check"))
     safetynet: LayerResult = field(default_factory=lambda: LayerResult("SafetyNet (Legacy)"))
-    play_asset_delivery: LayerResult = field(default_factory=lambda: LayerResult("Play Asset Delivery"))
-    manifest_analysis: LayerResult = field(default_factory=lambda: LayerResult("Manifest Analysis"))
+    informational: LayerResult = field(default_factory=lambda: LayerResult("Informational"))
     all_findings: list[Finding] = field(default_factory=list)
     error: str = ""
