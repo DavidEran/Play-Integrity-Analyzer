@@ -2,6 +2,7 @@
 
 # =============================================================================
 # Layer 1: Auto Protection / pairip Detection (MOST IMPORTANT)
+# Detection is file-listing only: check for libpairip.so in the APK ZIP entries.
 # =============================================================================
 
 PAIRIP_FILE_PATTERNS = [
@@ -9,16 +10,10 @@ PAIRIP_FILE_PATTERNS = [
     "libpairipcore.so",
 ]
 
+# DEX patterns limited to specific obfuscated class paths (no short strings)
 PAIRIP_DEX_PATTERNS = [
     "com.google.android.play.core.integrity.al",
     "com/google/android/play/core/integrity/al",
-    "pairip",
-]
-
-PAIRIP_MANIFEST_PATTERNS = [
-    "pairip",
-    "com.google.android.play.core.missingsplits",
-    "MissingSplitsDetectingApplication",
 ]
 
 # =============================================================================
@@ -39,27 +34,21 @@ INTEGRITY_TOKEN_REQUEST_PATTERNS = [
     "prepareIntegrityToken",
 ]
 
+# Only long, unique-to-Play-Integrity field names and verdict values.
+# Removed short/generic strings like LICENSED, UNLICENSED, UNEVALUATED, NO_LICENSE
+# that match Apache license text, npm metadata, etc.
 INTEGRITY_VERDICT_PATTERNS = [
     "appRecognitionVerdict",
-    "PLAY_RECOGNIZED",
-    "UNRECOGNIZED_VERSION",
-    "UNEVALUATED",
     "deviceRecognitionVerdict",
     "appLicensingVerdict",
-    "NO_LICENSE",
-    "LICENSED",
-    "UNLICENSED",
+    "PLAY_RECOGNIZED",
+    "UNRECOGNIZED_VERSION",
     "GET_LICENSED",
 ]
 
+# Only the unique field name — individual enum values are too generic.
 INTEGRITY_APP_ACCESS_RISK_PATTERNS = [
     "appAccessRiskVerdict",
-    "KNOWN_INSTALLED",
-    "KNOWN_CAPTURING",
-    "KNOWN_CONTROLLING",
-    "UNKNOWN_INSTALLED",
-    "UNKNOWN_CAPTURING",
-    "UNKNOWN_CONTROLLING",
 ]
 
 # Combined sideload-specific verdicts (subset used for risk escalation)
@@ -70,26 +59,22 @@ SIDELOAD_BLOCK_VERDICTS = [
 
 # =============================================================================
 # Layer 3: Legacy SafetyNet Detection
+# Full class paths only — no short standalone strings.
 # =============================================================================
 
 SAFETYNET_PATTERNS = [
     "com/google/android/gms/safetynet/SafetyNet",
     "com/google/android/gms/safetynet/SafetyNetClient",
     "com/google/android/gms/safetynet/SafetyNetApi",
-    "SafetyNetClient",
 ]
 
 # =============================================================================
 # Layer 4: Firebase App Check Detection
+# Only the Play Integrity-specific provider triggers risk scoring.
 # =============================================================================
 
 FIREBASE_APPCHECK_PATTERNS = [
-    "com/google/firebase/appcheck/FirebaseAppCheck",
-    "com/google/firebase/appcheck/AppCheckToken",
     "com/google/firebase/appcheck/playintegrity/PlayIntegrityAppCheckProviderFactory",
-    "FirebaseAppCheck",
-    "AppCheckProviderFactory",
-    "installAppCheckProviderFactory",
 ]
 
 # =============================================================================
@@ -97,18 +82,12 @@ FIREBASE_APPCHECK_PATTERNS = [
 # =============================================================================
 
 MANIFEST_PLAY_CORE_PATTERNS = [
-    "com.google.android.play.core",
     "com.google.android.play.core.assetpacks",
-    "com.google.android.play.core.missingsplits.MissingSplitsDetectingApplication",
-    "getInstallerPackageName",
-    "getInstallSourceInfo",
 ]
 
 PLAY_ASSET_DELIVERY_PATTERNS = [
-    "com.google.android.play.core.assetpacks",
-    "AssetPackManager",
-    "AssetPackStates",
-    "onDemand",
+    "com/google/android/play/core/assetpacks/AssetPackManager",
+    "com/google/android/play/core/assetpacks/AssetPackStates",
 ]
 
 META_INF_PATTERNS = [

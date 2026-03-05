@@ -8,7 +8,6 @@ from models import AnalysisResult, Finding, LayerResult, RiskLevel, RISK_DESCRIP
 from detection_patterns import (
     PAIRIP_FILE_PATTERNS,
     PAIRIP_DEX_PATTERNS,
-    PAIRIP_MANIFEST_PATTERNS,
     INTEGRITY_API_CLASS_PATTERNS,
     INTEGRITY_TOKEN_REQUEST_PATTERNS,
     INTEGRITY_VERDICT_PATTERNS,
@@ -183,12 +182,7 @@ def _scan_manifest(apk: zipfile.ZipFile, result: AnalysisResult):
         encoding = "latin-1" if text is manifest_latin1 else "utf-16-le"
         source = f"AndroidManifest.xml ({encoding})"
 
-        # pairip in manifest
-        findings = _search_text(text, PAIRIP_MANIFEST_PATTERNS, source, "Auto Protection (pairip)")
-        result.auto_protection.findings.extend(findings)
-        result.all_findings.extend(findings)
-
-        # Play Core / manifest patterns
+        # Play Core / manifest patterns (informational only)
         findings = _search_text(text, MANIFEST_PLAY_CORE_PATTERNS, source, "Manifest Analysis")
         result.manifest_analysis.findings.extend(findings)
         result.all_findings.extend(findings)
@@ -277,6 +271,14 @@ def _classify_risk(result: AnalysisResult):
     has_token_requests = any(p in integrity_matched for p in INTEGRITY_TOKEN_REQUEST_PATTERNS)
     has_verdicts = any(p in integrity_matched for p in INTEGRITY_VERDICT_PATTERNS + INTEGRITY_APP_ACCESS_RISK_PATTERNS)
     has_sideload_block = any(p in integrity_matched for p in SIDELOAD_BLOCK_VERDICTS)
+
+    # Corroboration gate: token requests, verdicts, and sideload block verdicts
+    # only count if at least one API class is also present. This prevents
+    # false positives from short strings matching unrelated code.
+    if not has_api_classes:
+        has_token_requests = False
+        has_verdicts = False
+        has_sideload_block = False
 
     if result.auto_protection.detected:
         result.risk_level = RiskLevel.CRITICAL
