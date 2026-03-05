@@ -151,26 +151,6 @@ with tab_batch:
 # Sideload Test Tab
 # ---------------------------------------------------------------------------
 
-def _ensure_adb_and_device():
-    """Ensure ADB is available (auto-download if needed) and check for device.
-
-    Returns (adb_ready, device_connected, message, serial).
-    """
-    from adb_provisioner import ensure_adb, check_device
-
-    # Step 1: Ensure ADB binary exists
-    try:
-        adb_path = ensure_adb()
-    except RuntimeError as e:
-        return False, False, str(e), None
-
-    # Step 2: Check for connected device
-    try:
-        _, serial = check_device()
-        return True, True, serial, serial
-    except RuntimeError as e:
-        return True, False, str(e), None
-
 
 def _verdict_badge(verdict):
     """Return a styled badge for PASS/FAIL/REVIEW verdict."""
@@ -188,7 +168,6 @@ def _verdict_badge(verdict):
 def _run_sideload_test(apk_path, timeout, screenshots_dir, serial):
     """Run sideload test for a single APK using the sideload_test module."""
     import sideload_test as st_mod
-
     result = st_mod.test_single_apk(apk_path, timeout, screenshots_dir, serial=serial)
     return result
 
@@ -256,172 +235,189 @@ def _render_sideload_result(result):
 with tab_sideload:
     st.subheader("Runtime Sideload Test")
     st.caption(
-        "Install APKs on a connected Android device, launch them, "
-        "and detect anti-sideload mechanisms (Play Auto Protect, licensing checks, integrity gates)."
+        "Upload APKs, and the tool will automatically install them on a virtual Android device, "
+        "launch them, and check for anti-sideload blocking (Play Auto Protect, licensing, integrity checks). "
+        "No phone or technical setup required."
     )
 
-    # Setup guidance for non-technical users
-    with st.expander("📱 Setup Guide (first time only)", expanded=False):
-        st.markdown("""
-**What you need:** An Android phone/tablet connected to this computer via USB cable.
+    from emulator_provisioner import (
+        get_emulator_status, provision_emulator, boot_emulator,
+        shutdown_emulator, is_provisioned,
+    )
+    import sideload_test as st_mod
 
-**One-time phone setup:**
-1. On your Android device, go to **Settings → About Phone**
-2. Tap **Build Number** 7 times (this enables Developer Options)
-3. Go back to **Settings → Developer Options**
-4. Enable **USB Debugging**
-5. Connect your phone via USB cable
-6. When prompted on the phone, tap **Allow USB Debugging**
+    # Check current state
+    emu_status = get_emulator_status()
 
-**That's it!** ADB (the tool that talks to your phone) will be downloaded automatically — no manual install needed.
-
-*If using an emulator (Android Studio), just make sure it's running.*
-        """)
-
-    # Check prerequisites with auto-provisioning
-    adb_ready, device_connected, message, serial = _ensure_adb_and_device()
-
-    if not adb_ready:
-        st.error(f"Failed to set up ADB: {message}")
-        st.info("Try refreshing the page. If the problem persists, check your internet connection.")
-    elif not device_connected:
-        st.warning("⚠️ No Android device detected.")
+    # ---- Step 1: One-time setup (download SDK + emulator) ----
+    if not emu_status["avd_exists"]:
         st.info(
-            "Make sure your phone is:\n"
-            "- Connected via USB cable\n"
-            "- USB Debugging is enabled (see Setup Guide above)\n"
-            "- You tapped 'Allow' on the USB debugging prompt on your phone\n\n"
-            "Then **refresh this page**."
+            "**First-time setup required.** The tool needs to download an Android emulator (~3 GB). "
+            "This only happens once — after that, tests start instantly."
         )
-        if st.button("🔄 Check Again", key="recheck_device"):
-            st.rerun()
+        if st.button("⬇️ Download & Set Up Emulator", key="provision_emu", type="primary"):
+            setup_status = st.status("Setting up Android emulator...", expanded=True)
+            with setup_status:
+                try:
+                    provision_emulator(
+                        progress_callback=lambda msg: st.write(msg)
+                    )
+                    st.write("✅ Setup complete!")
+                    setup_status.update(label="Setup complete!", state="complete")
+                    st.session_state["emu_provisioned"] = True
+                    st.rerun()
+                except RuntimeError as e:
+                    st.error(f"Setup failed: {e}")
+                    setup_status.update(label="Setup failed", state="error")
+
     else:
-        st.success(f"✅ Device connected: `{serial}`")
+        # ---- Step 2: Emulator is provisioned, manage its lifecycle ----
+        if emu_status["emulator_running"]:
+            serial = emu_status["running_serial"]
+            from adb_provisioner import get_device_model as _get_model
+            device_model = _get_model(serial)
+            st.success(f"✅ Virtual device running: {device_model} (`{serial}`)")
 
-        from adb_provisioner import get_device_model as _get_model
-        device_model = _get_model(serial)
-        st.markdown(f"**Device:** {device_model}")
+            col_stop, _ = st.columns([1, 3])
+            with col_stop:
+                if st.button("⏹️ Stop Emulator", key="stop_emu"):
+                    shutdown_emulator(serial)
+                    st.rerun()
+        else:
+            serial = None
+            st.warning("Virtual device is not running.")
+            if st.button("▶️ Start Virtual Device", key="start_emu", type="primary"):
+                boot_status = st.status("Starting virtual device...", expanded=True)
+                with boot_status:
+                    try:
+                        serial = boot_emulator(
+                            progress_callback=lambda msg: st.write(msg)
+                        )
+                        st.write(f"✅ Ready: `{serial}`")
+                        boot_status.update(label="Virtual device ready!", state="complete")
+                        st.session_state["emu_serial"] = serial
+                        st.rerun()
+                    except RuntimeError as e:
+                        st.error(f"Failed to start: {e}")
+                        boot_status.update(label="Start failed", state="error")
 
-        import sideload_test as st_mod
+        # ---- Step 3: Upload & test APKs (only when emulator is running) ----
+        if emu_status["emulator_running"]:
+            serial = emu_status["running_serial"]
 
-        # Upload APKs
-        sideload_files = st.file_uploader(
-            "Upload APK file(s) to sideload test",
-            type=["apk"],
-            accept_multiple_files=True,
-            key="sideload_upload",
-        )
+            st.markdown("---")
+            st.subheader("Upload APKs to Test")
 
-        col_timeout, col_dir = st.columns(2)
-        with col_timeout:
-            timeout_val = st.number_input(
+            sideload_files = st.file_uploader(
+                "Upload APK file(s)",
+                type=["apk"],
+                accept_multiple_files=True,
+                key="sideload_upload",
+            )
+
+            timeout_val = st.slider(
                 "Monitor timeout (seconds)", min_value=5, max_value=120, value=30, key="sideload_timeout"
             )
-        with col_dir:
-            screenshots_dir = st.text_input(
-                "Screenshots directory", value="./screenshots", key="sideload_ss_dir"
-            )
 
-        if sideload_files:
-            st.write(f"**{len(sideload_files)} APK(s) selected**")
+            screenshots_dir = "./screenshots"
 
-            if st.button("Run Sideload Test", key="run_sideload", type="primary"):
-                all_results = []
-                progress = st.progress(0)
+            if sideload_files:
+                st.write(f"**{len(sideload_files)} APK(s) selected**")
 
-                for i, uploaded in enumerate(sideload_files):
-                    status_container = st.status(f"Testing: {uploaded.name}", expanded=True)
-                    with status_container:
-                        # Save uploaded file to temp location
-                        with tempfile.NamedTemporaryFile(suffix=".apk", delete=False) as tmp:
-                            tmp.write(uploaded.read())
-                            tmp_path = tmp.name
+                if st.button("🚀 Run Sideload Test", key="run_sideload", type="primary"):
+                    all_results = []
+                    progress = st.progress(0)
 
-                        try:
-                            # Extract info first for display
-                            info = st_mod.extract_apk_info(tmp_path)
-                            display_name = info["app_label"] or info["package_name"] or uploaded.name
-                            st.write(f"**App:** {display_name}")
-                            if info["package_name"]:
-                                st.write(f"**Package:** `{info['package_name']}`")
+                    for i, uploaded in enumerate(sideload_files):
+                        status_container = st.status(f"Testing: {uploaded.name}", expanded=True)
+                        with status_container:
+                            with tempfile.NamedTemporaryFile(suffix=".apk", delete=False) as tmp:
+                                tmp.write(uploaded.read())
+                                tmp_path = tmp.name
 
-                            st.write("⏳ Running sideload test...")
-                            result = _run_sideload_test(
-                                tmp_path, timeout_val, screenshots_dir, serial
-                            )
-                            result["apk_file"] = uploaded.name
-                            all_results.append(result)
+                            try:
+                                info = st_mod.extract_apk_info(tmp_path)
+                                display_name = info["app_label"] or info["package_name"] or uploaded.name
+                                st.write(f"**App:** {display_name}")
+                                if info["package_name"]:
+                                    st.write(f"**Package:** `{info['package_name']}`")
 
-                            verdict = result.get("verdict", "FAIL")
-                            if verdict == "PASS":
-                                st.write(f"✅ **PASS:** {result.get('verdict_reason', '')}")
-                            elif verdict == "FAIL":
-                                st.write(f"❌ **FAIL:** {result.get('verdict_reason', '')}")
-                            else:
-                                st.write(f"⚠️ **REVIEW:** {result.get('verdict_reason', '')}")
-                        finally:
-                            os.unlink(tmp_path)
+                                st.write("⏳ Running sideload test...")
+                                result = _run_sideload_test(
+                                    tmp_path, timeout_val, screenshots_dir, serial
+                                )
+                                result["apk_file"] = uploaded.name
+                                all_results.append(result)
 
-                    progress.progress((i + 1) / len(sideload_files))
+                                verdict = result.get("verdict", "FAIL")
+                                if verdict == "PASS":
+                                    st.write(f"✅ **PASS:** {result.get('verdict_reason', '')}")
+                                elif verdict == "FAIL":
+                                    st.write(f"❌ **FAIL:** {result.get('verdict_reason', '')}")
+                                else:
+                                    st.write(f"⚠️ **REVIEW:** {result.get('verdict_reason', '')}")
+                            finally:
+                                os.unlink(tmp_path)
 
-                st.session_state["sideload_results"] = all_results
+                        progress.progress((i + 1) / len(sideload_files))
 
-        if "sideload_results" in st.session_state:
-            results = st.session_state["sideload_results"]
+                    st.session_state["sideload_results"] = all_results
 
-            # Summary
-            st.subheader("Results Summary")
-            pass_count = sum(1 for r in results if r.get("verdict") == "PASS")
-            fail_count = sum(1 for r in results if r.get("verdict") == "FAIL")
-            review_count = sum(1 for r in results if r.get("verdict") == "REVIEW")
+            if "sideload_results" in st.session_state:
+                results = st.session_state["sideload_results"]
 
-            col_p, col_f, col_r = st.columns(3)
-            col_p.metric("PASS", pass_count)
-            col_f.metric("FAIL", fail_count)
-            col_r.metric("REVIEW", review_count)
+                # Summary
+                st.subheader("Results Summary")
+                pass_count = sum(1 for r in results if r.get("verdict") == "PASS")
+                fail_count = sum(1 for r in results if r.get("verdict") == "FAIL")
+                review_count = sum(1 for r in results if r.get("verdict") == "REVIEW")
 
-            # Summary table
-            summary_data = [
-                {
-                    "APK": r.get("apk_file", ""),
-                    "Package": r.get("package_name", ""),
-                    "App Name": r.get("app_name", ""),
-                    "Verdict": r.get("verdict", ""),
-                    "Reason": (r.get("verdict_reason", "")[:80] + "...") if len(r.get("verdict_reason", "")) > 80 else r.get("verdict_reason", ""),
-                    "Duration (s)": r.get("duration_seconds", 0),
+                col_p, col_f, col_r = st.columns(3)
+                col_p.metric("PASS", pass_count)
+                col_f.metric("FAIL", fail_count)
+                col_r.metric("REVIEW", review_count)
+
+                summary_data = [
+                    {
+                        "APK": r.get("apk_file", ""),
+                        "Package": r.get("package_name", ""),
+                        "App Name": r.get("app_name", ""),
+                        "Verdict": r.get("verdict", ""),
+                        "Reason": (r.get("verdict_reason", "")[:80] + "...") if len(r.get("verdict_reason", "")) > 80 else r.get("verdict_reason", ""),
+                        "Duration (s)": r.get("duration_seconds", 0),
+                    }
+                    for r in results
+                ]
+                st.dataframe(summary_data, use_container_width=True)
+
+                st.subheader("Detailed Results")
+                for r in results:
+                    verdict = r.get("verdict", "FAIL")
+                    icon = {"PASS": "✅", "FAIL": "❌", "REVIEW": "⚠️"}.get(verdict, "❓")
+                    label = f"{icon} {r.get('apk_file', 'Unknown')} — {verdict}"
+                    with st.expander(label, expanded=(verdict != "PASS")):
+                        _render_sideload_result(r)
+
+                from adb_provisioner import get_device_model as _get_model_report
+                device_model_report = _get_model_report(serial)
+                report = {
+                    "test_run": {
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "device": device_model_report,
+                        "adb_serial": serial,
+                        "tool_version": st_mod.TOOL_VERSION,
+                    },
+                    "results": results,
+                    "summary": {
+                        "total": len(results),
+                        "pass": pass_count,
+                        "fail": fail_count,
+                        "review": review_count,
+                    },
                 }
-                for r in results
-            ]
-            st.dataframe(summary_data, use_container_width=True)
-
-            # Detailed results
-            st.subheader("Detailed Results")
-            for r in results:
-                verdict = r.get("verdict", "FAIL")
-                icon = {"PASS": "✅", "FAIL": "❌", "REVIEW": "⚠️"}.get(verdict, "❓")
-                label = f"{icon} {r.get('apk_file', 'Unknown')} — {verdict}"
-                with st.expander(label, expanded=(verdict != "PASS")):
-                    _render_sideload_result(r)
-
-            # Download JSON report
-            report = {
-                "test_run": {
-                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "device": device_model,
-                    "adb_serial": serial,
-                    "tool_version": st_mod.TOOL_VERSION,
-                },
-                "results": results,
-                "summary": {
-                    "total": len(results),
-                    "pass": pass_count,
-                    "fail": fail_count,
-                    "review": review_count,
-                },
-            }
-            st.download_button(
-                "Download JSON Report",
-                json.dumps(report, indent=2),
-                file_name="sideload_report.json",
-                mime="application/json",
-            )
+                st.download_button(
+                    "📥 Download JSON Report",
+                    json.dumps(report, indent=2),
+                    file_name="sideload_report.json",
+                    mime="application/json",
+                )
