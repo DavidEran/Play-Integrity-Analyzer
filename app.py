@@ -20,7 +20,9 @@ st.set_page_config(page_title="Play Integrity Analyzer", page_icon="🔍", layou
 st.title("Play Integrity Analyzer")
 st.caption("Detect Google Play Integrity API and Auto Protection (pairip) in Android APKs to assess sideloading risk.")
 
-tab_single, tab_batch, tab_sideload = st.tabs(["Single APK Analysis", "Batch Analysis", "Sideload Test"])
+tab_single, tab_batch, tab_sideload, tab_cloud = st.tabs(
+    ["Single APK Analysis", "Batch Analysis", "Sideload Test", "Cloud Device Test"]
+)
 
 
 def _risk_badge(risk_level):
@@ -424,3 +426,256 @@ with tab_sideload:
                     file_name="sideload_report.json",
                     mime="application/json",
                 )
+
+# ---------------------------------------------------------------------------
+# Cloud Device Test Tab (Firebase Test Lab)
+# ---------------------------------------------------------------------------
+
+
+def _cloud_verdict_badge(verdict):
+    colors = {"PASS": "#28a745", "FAIL": "#dc3545", "REVIEW": "#ffc107"}
+    text_colors = {"PASS": "#FFFFFF", "FAIL": "#FFFFFF", "REVIEW": "#000000"}
+    color = colors.get(verdict, "#6c757d")
+    text_color = text_colors.get(verdict, "#FFFFFF")
+    return (
+        f'<span style="background-color:{color};color:{text_color};'
+        f'padding:6px 18px;border-radius:6px;font-weight:bold;font-size:1.3em;">'
+        f'{verdict}</span>'
+    )
+
+
+with tab_cloud:
+    st.subheader("Cloud Device Test")
+    st.caption(
+        "Test APKs on real phones and tablets via Firebase Test Lab. "
+        "Upload a Google Cloud service account key, pick a device, and click test. "
+        "Free tier: 5 physical device tests/day, 10 virtual device tests/day."
+    )
+
+    # ---- Step 1: Service account setup ----
+    with st.expander("🔑 Google Cloud Setup (one-time)", expanded="ftl_client" not in st.session_state):
+        st.markdown(
+            "**Quick setup (5 minutes):**\n"
+            "1. Go to [Google Cloud Console](https://console.cloud.google.com)\n"
+            "2. Create a project (or use existing)\n"
+            "3. Enable **Cloud Testing API** and **Cloud Tool Results API**\n"
+            "4. Go to **IAM > Service Accounts** → Create one\n"
+            "5. Grant roles: *Cloud Test Service Agent* + *Storage Admin*\n"
+            "6. Create a JSON key and upload it below"
+        )
+        sa_file = st.file_uploader(
+            "Upload service account JSON key",
+            type=["json"],
+            key="sa_key_upload",
+        )
+        if sa_file is not None:
+            try:
+                sa_json = json.loads(sa_file.read())
+            except json.JSONDecodeError:
+                st.error("Invalid JSON file.")
+                sa_json = None
+
+            if sa_json and st.button("🔗 Connect", key="connect_gcp"):
+                with st.spinner("Validating credentials..."):
+                    from firebase_test_lab import validate_service_account, FirebaseTestLab
+                    ok, msg = validate_service_account(sa_json)
+                if ok:
+                    st.success(msg)
+                    st.session_state["ftl_sa_json"] = sa_json
+                    st.session_state["ftl_client"] = FirebaseTestLab(sa_json)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    # ---- Connected state ----
+    if "ftl_client" in st.session_state:
+        ftl: "FirebaseTestLab" = st.session_state["ftl_client"]
+        st.success(f"Connected to project **{ftl.project_id}**")
+
+        if st.button("Disconnect", key="disconnect_gcp"):
+            del st.session_state["ftl_client"]
+            del st.session_state["ftl_sa_json"]
+            st.rerun()
+
+        st.markdown("---")
+
+        # ---- Step 2: Pick device ----
+        st.subheader("Select Device")
+
+        # Fetch catalog once per session
+        if "ftl_devices" not in st.session_state:
+            with st.spinner("Loading device catalog..."):
+                try:
+                    from firebase_test_lab import POPULAR_DEVICES
+                    st.session_state["ftl_devices"] = POPULAR_DEVICES
+                    try:
+                        full_catalog = ftl.list_available_devices()
+                        st.session_state["ftl_full_catalog"] = full_catalog
+                    except Exception:
+                        st.session_state["ftl_full_catalog"] = []
+                except Exception as e:
+                    st.error(f"Failed to load devices: {e}")
+                    st.session_state["ftl_devices"] = []
+                    st.session_state["ftl_full_catalog"] = []
+
+        show_all = st.checkbox("Show all available devices", key="show_all_devices")
+        device_list = (
+            st.session_state.get("ftl_full_catalog", [])
+            if show_all
+            else st.session_state.get("ftl_devices", [])
+        )
+
+        if device_list:
+            device_options = {
+                f"{d['name']} ({d.get('brand', '')}) — API {', '.join(str(a) for a in d.get('api_levels', [])[-3:])}".strip(): d
+                for d in device_list
+                if d.get("api_levels")
+            }
+            selected_label = st.selectbox(
+                "Device",
+                options=list(device_options.keys()),
+                key="ftl_device_select",
+            )
+            selected_device = device_options[selected_label]
+
+            # API level picker
+            available_apis = selected_device.get("api_levels", [])
+            default_api = available_apis[-1] if available_apis else 34
+            selected_api = st.selectbox(
+                "Android API level",
+                options=available_apis,
+                index=len(available_apis) - 1 if available_apis else 0,
+                key="ftl_api_select",
+            )
+        else:
+            st.warning("No devices available.")
+            selected_device = None
+            selected_api = None
+
+        st.markdown("---")
+
+        # ---- Step 3: Upload & test ----
+        st.subheader("Upload APK & Test")
+
+        cloud_apk = st.file_uploader(
+            "Upload APK file",
+            type=["apk"],
+            key="cloud_apk_upload",
+        )
+
+        test_timeout = st.slider(
+            "Robo test timeout (seconds)",
+            min_value=30,
+            max_value=300,
+            value=120,
+            step=30,
+            key="ftl_timeout",
+        )
+
+        if cloud_apk and selected_device:
+            st.write(f"**APK:** {cloud_apk.name} ({cloud_apk.size / (1024*1024):.1f} MB)")
+            st.write(f"**Device:** {selected_device['name']} — API {selected_api}")
+
+            if st.button("🚀 Run Cloud Test", key="run_cloud_test", type="primary"):
+                apk_bytes = cloud_apk.read()
+
+                # Create test
+                with st.spinner("Uploading APK and creating test..."):
+                    try:
+                        matrix = ftl.create_robo_test(
+                            apk_bytes=apk_bytes,
+                            apk_filename=cloud_apk.name,
+                            device_id=selected_device["id"],
+                            api_level=selected_api,
+                            timeout_sec=test_timeout,
+                        )
+                        matrix_id = matrix["testMatrixId"]
+                        st.info(f"Test created: `{matrix_id}`")
+                    except Exception as e:
+                        st.error(f"Failed to create test: {e}")
+                        matrix_id = None
+
+                # Poll for completion
+                if matrix_id:
+                    status_text = st.empty()
+                    progress_bar = st.progress(0)
+
+                    def _update_progress(state, elapsed):
+                        status_text.info(f"⏳ State: **{state}** ({elapsed}s elapsed)")
+                        # Rough progress estimate (tests usually take 2-5 min)
+                        pct = min(elapsed / (test_timeout + 120), 0.95)
+                        progress_bar.progress(pct)
+
+                    try:
+                        final_matrix = ftl.wait_for_completion(
+                            matrix_id,
+                            poll_interval=10,
+                            max_wait=test_timeout + 300,
+                            progress_callback=_update_progress,
+                        )
+                        progress_bar.progress(1.0)
+                        status_text.empty()
+
+                        state = final_matrix.get("state", "UNKNOWN")
+                        if state == "FINISHED":
+                            st.success("Test completed!")
+                        else:
+                            st.warning(f"Test ended with state: {state}")
+
+                        # Parse & display results
+                        results = ftl.parse_results(final_matrix)
+                        st.session_state["cloud_results"] = results
+                        st.session_state["cloud_matrix"] = final_matrix
+                        st.session_state["cloud_apk_name"] = cloud_apk.name
+
+                    except Exception as e:
+                        st.error(f"Error during test: {e}")
+
+        # ---- Display results ----
+        if "cloud_results" in st.session_state:
+            results = st.session_state["cloud_results"]
+            st.markdown("---")
+            st.subheader("Cloud Test Results")
+
+            for r in results:
+                verdict = r.get("verdict", "REVIEW")
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    st.markdown(_cloud_verdict_badge(verdict), unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f"**Device:** {r['device']} — API {r['api_level']}")
+                    st.markdown(f"**Verdict:** {r['verdict_reason']}")
+
+                # Video
+                if r.get("video_url"):
+                    with st.expander("🎬 Test Video"):
+                        st.video(r["video_url"])
+
+                # Screenshots
+                if r.get("screenshot_urls"):
+                    with st.expander(f"📸 Screenshots ({len(r['screenshot_urls'])})"):
+                        cols = st.columns(min(len(r["screenshot_urls"]), 3))
+                        for idx, url in enumerate(r["screenshot_urls"]):
+                            cols[idx % 3].image(url)
+
+                # Logcat
+                if r.get("logcat_url"):
+                    st.markdown(f"[📋 View Logcat]({r['logcat_url']})")
+
+            # JSON download
+            cloud_report = {
+                "test_run": {
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "service": "Firebase Test Lab",
+                    "project": ftl.project_id,
+                    "apk": st.session_state.get("cloud_apk_name", ""),
+                },
+                "results": results,
+            }
+            st.download_button(
+                "📥 Download JSON Report",
+                json.dumps(cloud_report, indent=2),
+                file_name="cloud_test_report.json",
+                mime="application/json",
+                key="download_cloud_report",
+            )
