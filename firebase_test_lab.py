@@ -15,6 +15,7 @@ Required GCP setup (one-time):
 
 import io
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -244,97 +245,120 @@ class FirebaseTestLab:
 
             time.sleep(poll_interval)
 
-    # -- result parsing ------------------------------------------------------
+    # -- result parsing with root-cause analysis ------------------------------
 
     def parse_results(self, matrix: dict) -> list[dict]:
-        """Convert a finished testMatrix into a list of result dicts
-        compatible with the existing sideload-test result format.
+        """Convert a finished testMatrix into result dicts with root-cause
+        analysis based on downloaded logcat and activity transitions.
 
         Each dict has keys: device, api_level, outcome, verdict,
-        verdict_reason, video_url, screenshot_urls, logcat_url,
-        duration_seconds.
+        verdict_summary, root_causes, logcat_excerpt, video_url,
+        screenshot_urls, logcat_url, duration_seconds.
         """
         results = []
         for execution in matrix.get("testExecutions", []):
             env = execution.get("environment", {}).get("androidDevice", {})
             device_id = env.get("androidModelId", "unknown")
             api_level = env.get("androidVersionId", "?")
-
-            outcome = execution.get("testDetails", {}).get("errorMessage", "")
-            tool_outputs = execution.get("toolResultsStep", {})
             step_state = execution.get("state", "UNKNOWN")
 
-            # Map Firebase outcome to our verdict scheme
-            verdict, reason = self._map_outcome(execution)
+            # Handle infra errors before downloading artifacts
+            if step_state in (
+                "ERROR", "UNSUPPORTED_ENVIRONMENT",
+                "INCOMPATIBLE_ENVIRONMENT",
+            ):
+                error_msg = execution.get("testDetails", {}).get(
+                    "errorMessage", "Test infrastructure error",
+                )
+                results.append({
+                    "device": device_id,
+                    "api_level": api_level,
+                    "outcome": step_state,
+                    "verdict": "FAIL",
+                    "verdict_summary": f"Test Lab error: {error_msg}",
+                    "root_causes": [],
+                    "logcat_excerpt": "",
+                    "video_url": None,
+                    "screenshot_urls": [],
+                    "logcat_url": None,
+                    "duration_seconds": 0,
+                })
+                continue
 
-            # Collect artifact URLs from GCS
-            result_storage = execution.get("resultStorage", {}).get(
-                "googleCloudStorage", {}
+            # Collect artifacts from GCS (logcat text + media URLs)
+            results_dir = (
+                execution.get("resultStorage", {})
+                .get("googleCloudStorage", {})
+                .get("gcsPath", "")
             )
-            results_dir = result_storage.get("gcsPath", "")
+            artifacts = self._collect_artifacts(results_dir)
+            logcat_text = artifacts.get("logcat_text", "")
 
-            artifact_urls = self._collect_artifacts(results_dir)
+            # Run root-cause analysis on the logcat
+            root_causes = _analyze_logcat(logcat_text)
+
+            # Determine verdict
+            has_play_store_redirect = any(
+                rc["category"] in (
+                    "play_auto_protect", "play_licensing",
+                    "play_integrity_api", "installer_source_check",
+                    "firebase_app_check", "play_store_redirect",
+                )
+                for rc in root_causes
+            )
+
+            # Check for crash with no Play Store involvement
+            crash_patterns = re.compile(
+                r"FATAL EXCEPTION|AndroidRuntime.*?Error|"
+                r"Process.*?has died|Force finishing activity",
+                re.IGNORECASE,
+            )
+            has_crash = bool(crash_patterns.search(logcat_text))
+
+            if has_play_store_redirect:
+                verdict = "FAIL"
+                categories = [rc["category_label"] for rc in root_causes]
+                verdict_summary = (
+                    f"Sideload Blocked: {', '.join(categories)} detected"
+                )
+            elif has_crash and not has_play_store_redirect:
+                verdict = "FAIL"
+                verdict_summary = "App Crash — no Play Store involvement detected"
+            else:
+                verdict = "PASS"
+                verdict_summary = "Sideload Safe — no blocking detected"
+
+            # Build a concise logcat excerpt (relevant lines only)
+            logcat_excerpt = _build_logcat_excerpt(logcat_text, root_causes)
 
             results.append({
                 "device": device_id,
                 "api_level": api_level,
                 "outcome": step_state,
                 "verdict": verdict,
-                "verdict_reason": reason,
-                "video_url": artifact_urls.get("video"),
-                "screenshot_urls": artifact_urls.get("screenshots", []),
-                "logcat_url": artifact_urls.get("logcat"),
+                "verdict_summary": verdict_summary,
+                "root_causes": root_causes,
+                "logcat_excerpt": logcat_excerpt,
+                "video_url": artifacts.get("video"),
+                "screenshot_urls": artifacts.get("screenshots", []),
+                "logcat_url": artifacts.get("logcat_url"),
                 "duration_seconds": 0,
             })
 
         return results
 
-    def _map_outcome(self, execution: dict) -> tuple[str, str]:
-        """Map a Firebase Test Lab execution result to PASS/FAIL/REVIEW."""
-        state = execution.get("state", "")
-
-        if state in ("ERROR", "UNSUPPORTED_ENVIRONMENT", "INCOMPATIBLE_ENVIRONMENT"):
-            error_msg = execution.get("testDetails", {}).get(
-                "errorMessage", "Test infrastructure error"
-            )
-            return "FAIL", f"Test Lab error: {error_msg}"
-
-        # Check the test issue details if available
-        details = execution.get("testDetails", {})
-        progress = details.get("progressMessages", [])
-
-        # When finished, check the tool results outcome
-        tool_step = execution.get("toolResultsStep", {})
-        outcome_summary = ""
-
-        # The outcome is in the testExecution directly for v1
-        test_details = execution.get("testDetails", {})
-
-        # Check for specific failure signals in progress messages
-        progress_text = " ".join(progress).lower()
-        if any(kw in progress_text for kw in [
-            "play protect", "license", "integrity", "not installed",
-            "play store", "anti-sideload",
-        ]):
-            return "FAIL", f"Anti-sideload signal detected in test output"
-
-        if state == "FINISHED":
-            # No obvious failure signals — but we can't inspect UI keywords
-            # from the robo test alone, so REVIEW if there were any issues
-            if "error" in progress_text or "crash" in progress_text:
-                return "REVIEW", "App crashed or errored during robo test"
-            return "PASS", "Robo test completed — no blocking detected"
-
-        return "REVIEW", f"Test ended in state: {state}"
-
     def _collect_artifacts(self, gcs_dir: str) -> dict:
-        """List artifact URLs from a GCS results directory."""
-        artifacts = {"screenshots": [], "video": None, "logcat": None}
+        """Download logcat text and collect signed URLs for media artifacts."""
+        artifacts = {
+            "screenshots": [],
+            "video": None,
+            "logcat_url": None,
+            "logcat_text": "",
+        }
 
         if not gcs_dir or not gcs_dir.startswith("gs://"):
             return artifacts
 
-        # Parse bucket and prefix from gs:// URI
         path = gcs_dir[5:]  # strip "gs://"
         parts = path.split("/", 1)
         bucket_name = parts[0]
@@ -342,14 +366,12 @@ class FirebaseTestLab:
 
         try:
             bucket = self._storage.bucket(bucket_name)
-            blobs = list(bucket.list_blobs(prefix=prefix, max_results=100))
+            blobs = list(bucket.list_blobs(prefix=prefix, max_results=200))
 
             for blob in blobs:
                 name_lower = blob.name.lower()
-                public_url = blob.public_url
 
                 if name_lower.endswith(".mp4") or "video" in name_lower:
-                    # Generate a signed URL instead (bucket is private)
                     artifacts["video"] = blob.generate_signed_url(
                         expiration=3600,
                     )
@@ -357,14 +379,294 @@ class FirebaseTestLab:
                     artifacts["screenshots"].append(
                         blob.generate_signed_url(expiration=3600)
                     )
-                elif "logcat" in name_lower:
-                    artifacts["logcat"] = blob.generate_signed_url(
+                elif "logcat" in name_lower and not name_lower.endswith(
+                    (".png", ".jpg", ".mp4")
+                ):
+                    # Download the actual logcat text for analysis
+                    artifacts["logcat_url"] = blob.generate_signed_url(
                         expiration=3600,
                     )
+                    try:
+                        artifacts["logcat_text"] = blob.download_as_text(
+                            encoding="utf-8"
+                        )
+                    except Exception:
+                        # Fallback: try binary download
+                        try:
+                            raw = blob.download_as_bytes()
+                            artifacts["logcat_text"] = raw.decode(
+                                "utf-8", errors="replace"
+                            )
+                        except Exception:
+                            pass
         except Exception:
             pass  # Artifacts are best-effort
 
         return artifacts
+
+
+# ---------------------------------------------------------------------------
+# Root-cause analysis engine
+# ---------------------------------------------------------------------------
+
+# Detection categories, checked in priority order.  Each category has:
+#   - logcat_patterns: regex patterns to search for in logcat text
+#   - activity_patterns: regex for activity transitions (optional)
+#   - category_label: human-readable name
+#   - description: full explanation for the report
+#   - recommendation: what to tell the developer
+
+_DETECTION_CATEGORIES = [
+    {
+        "category": "play_auto_protect",
+        "category_label": "Play Auto Protect",
+        "logcat_patterns": [
+            r"AutoProtect",
+            r"Play\s*[Pp]rotect",
+            r"Get this app from Play",
+            r"DENY_APP",
+            r"PlayAutoInstallDenyReportService",
+            r"Integrity.*?sideload",
+            r"com\.android\.vending.*AutoProtect",
+        ],
+        "activity_patterns": [
+            r"com\.android\.vending.*AutoProtect",
+            r"com\.android\.vending.*PlayAutoInstall",
+        ],
+        "description": (
+            "Play Auto Protect \u2014 Google injected an install-time protection "
+            "that blocks sideloaded installs. The app redirects to the Play Store "
+            "with a \u2018Get this app from Play\u2019 dialog. The developer must "
+            "disable Auto Protect in Play Console under App Integrity settings, "
+            "or request a DT-compatible distribution."
+        ),
+        "recommendation": (
+            "Developer must disable Auto Protect in Play Console under "
+            "App Integrity settings, or request a DT-compatible distribution."
+        ),
+    },
+    {
+        "category": "play_licensing",
+        "category_label": "Play Licensing (LVL)",
+        "logcat_patterns": [
+            r"GET_LICENSED",
+            r"NOT_LICENSED",
+            r"LicenseChecker",
+            r"LicenseValidator",
+            r"ServerManagedPolicy",
+            r"license\s+check",
+            r"com\.android\.vending\.licensing",
+            r"ILicensingService",
+        ],
+        "activity_patterns": [
+            r"com\.android\.vending.*[Ll]icense",
+        ],
+        "description": (
+            "Play Licensing (LVL) \u2014 The app uses Google Play\u2019s License "
+            "Verification Library. Sideloaded installs return NOT_LICENSED because "
+            "the user has no Play Store purchase record. The developer must remove "
+            "or relax the LVL check for DT preload builds."
+        ),
+        "recommendation": (
+            "Developer must remove or relax the LVL check for DT preload builds."
+        ),
+    },
+    {
+        "category": "play_integrity_api",
+        "category_label": "Play Integrity API",
+        "logcat_patterns": [
+            r"IntegrityService",
+            r"IntegrityManager",
+            r"requestIntegrityToken",
+            r"play\.core\.integrity",
+            r"INTEGRITY_",
+            r"integrity\s+verdict",
+            r"attestation.*integrity",
+            r"com\.google\.android\.play\.core\.integrity",
+        ],
+        "activity_patterns": [],
+        "description": (
+            "Play Integrity API \u2014 The app requests a Play Integrity token and "
+            "the server-side validation rejected the sideloaded install. The "
+            "developer must allowlist DT\u2019s installer package or adjust their "
+            "integrity verdict handling."
+        ),
+        "recommendation": (
+            "Developer must allowlist DT\u2019s installer package or adjust "
+            "their integrity verdict handling."
+        ),
+    },
+    {
+        "category": "installer_source_check",
+        "category_label": "Installer Source Check",
+        "logcat_patterns": [
+            r"getInstallingPackageName",
+            r"getInstallSource",
+            r"installSource",
+            r"invalid\s+installer",
+            r"unknown\s+source",
+            r"installer.*com\.android\.vending",
+            r"PackageManager.*installer",
+        ],
+        "activity_patterns": [],
+        "description": (
+            "Installer Source Check \u2014 The app explicitly checks which store "
+            "installed it and blocks non-Play Store installs. The developer must "
+            "allowlist DT\u2019s installer package name."
+        ),
+        "recommendation": (
+            "Developer must allowlist DT\u2019s installer package name."
+        ),
+    },
+    {
+        "category": "firebase_app_check",
+        "category_label": "Firebase App Check",
+        "logcat_patterns": [
+            r"AppCheck",
+            r"app\s*check",
+            r"attestation\s+failed",
+            r"firebaseappcheck",
+            r"403.*firebase",
+            r"firebase.*403",
+        ],
+        "activity_patterns": [],
+        "description": (
+            "Firebase App Check \u2014 The app\u2019s backend APIs reject requests "
+            "from sideloaded installs because App Check attestation fails. The "
+            "developer must configure App Check to accept DT-distributed builds."
+        ),
+        "recommendation": (
+            "Developer must configure App Check to accept DT-distributed builds."
+        ),
+    },
+    {
+        "category": "play_store_redirect",
+        "category_label": "Play Store Redirect (Generic)",
+        "logcat_patterns": [
+            r"market://details",
+            r"play\.google\.com/store",
+            r"ACTION_VIEW.*market",
+            r"com\.android\.vending",
+            r"Starting.*com\.android\.vending",
+        ],
+        "activity_patterns": [
+            r"com\.android\.vending",
+        ],
+        "description": (
+            "Play Store Redirect \u2014 The app redirects to the Google Play Store "
+            "listing. Could not determine the specific mechanism. Manual "
+            "investigation recommended. See logcat excerpt below."
+        ),
+        "recommendation": (
+            "Could not determine the specific mechanism. Manual investigation "
+            "recommended."
+        ),
+    },
+]
+
+
+def _analyze_logcat(logcat_text: str) -> list[dict]:
+    """Scan logcat text for all matching anti-sideload categories.
+
+    Returns a list of root-cause dicts, each with:
+        category, category_label, description, recommendation, evidence
+    """
+    if not logcat_text:
+        return []
+
+    root_causes = []
+    # Track which generic-redirect evidence lines were already claimed
+    # by a more specific category so we don't double-count.
+    claimed_evidence_lines: set[str] = set()
+
+    for cat in _DETECTION_CATEGORIES:
+        evidence_lines: list[str] = []
+
+        # Search logcat line-by-line for pattern matches
+        for pattern_str in cat["logcat_patterns"]:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+            for line in logcat_text.splitlines():
+                if pattern.search(line):
+                    stripped = line.strip()
+                    if stripped and stripped not in evidence_lines:
+                        evidence_lines.append(stripped)
+
+        # Also check activity transition patterns
+        for pattern_str in cat.get("activity_patterns", []):
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+            for line in logcat_text.splitlines():
+                if pattern.search(line):
+                    stripped = line.strip()
+                    if stripped and stripped not in evidence_lines:
+                        evidence_lines.append(stripped)
+
+        if not evidence_lines:
+            continue
+
+        # For the generic "play_store_redirect" category, skip if ALL its
+        # evidence lines were already claimed by a more specific category.
+        if cat["category"] == "play_store_redirect":
+            unique = [l for l in evidence_lines if l not in claimed_evidence_lines]
+            if not unique:
+                continue
+            evidence_lines = unique
+
+        # Record these lines as claimed
+        for l in evidence_lines:
+            claimed_evidence_lines.add(l)
+
+        # Cap evidence to 20 lines per category for readability
+        root_causes.append({
+            "category": cat["category"],
+            "category_label": cat["category_label"],
+            "description": cat["description"],
+            "recommendation": cat["recommendation"],
+            "evidence": evidence_lines[:20],
+        })
+
+    return root_causes
+
+
+def _build_logcat_excerpt(logcat_text: str, root_causes: list[dict]) -> str:
+    """Build a concise logcat excerpt containing only the lines relevant
+    to the detected root causes, plus a few lines of surrounding context.
+    """
+    if not logcat_text or not root_causes:
+        # If no root causes but we have logcat, return last 50 lines
+        if logcat_text:
+            lines = logcat_text.splitlines()
+            return "\n".join(lines[-50:])
+        return ""
+
+    # Collect all evidence line texts
+    evidence_texts: set[str] = set()
+    for rc in root_causes:
+        for line in rc["evidence"]:
+            evidence_texts.add(line.strip())
+
+    # Find matching line indices and include 2 lines of context each side
+    all_lines = logcat_text.splitlines()
+    relevant_indices: set[int] = set()
+    for i, line in enumerate(all_lines):
+        if line.strip() in evidence_texts:
+            for j in range(max(0, i - 2), min(len(all_lines), i + 3)):
+                relevant_indices.add(j)
+
+    if not relevant_indices:
+        return "\n".join(all_lines[-50:])
+
+    # Build excerpt with "..." gaps between non-contiguous sections
+    sorted_indices = sorted(relevant_indices)
+    excerpt_lines: list[str] = []
+    prev_idx = -2
+    for idx in sorted_indices:
+        if idx > prev_idx + 1:
+            excerpt_lines.append("...")
+        excerpt_lines.append(all_lines[idx])
+        prev_idx = idx
+
+    # Cap at 200 lines
+    return "\n".join(excerpt_lines[:200])
 
 
 # ---------------------------------------------------------------------------

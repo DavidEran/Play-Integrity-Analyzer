@@ -433,14 +433,16 @@ with tab_sideload:
 
 
 def _cloud_verdict_badge(verdict):
-    colors = {"PASS": "#28a745", "FAIL": "#dc3545", "REVIEW": "#ffc107"}
-    text_colors = {"PASS": "#FFFFFF", "FAIL": "#FFFFFF", "REVIEW": "#000000"}
-    color = colors.get(verdict, "#6c757d")
-    text_color = text_colors.get(verdict, "#FFFFFF")
+    if verdict == "PASS":
+        color, text_color, label = "#28a745", "#FFFFFF", "PASS: Sideload Safe"
+    elif verdict == "FAIL":
+        color, text_color, label = "#dc3545", "#FFFFFF", "FAIL: Sideload Blocked"
+    else:
+        color, text_color, label = "#6c757d", "#FFFFFF", verdict
     return (
         f'<span style="background-color:{color};color:{text_color};'
-        f'padding:6px 18px;border-radius:6px;font-weight:bold;font-size:1.3em;">'
-        f'{verdict}</span>'
+        f'padding:8px 24px;border-radius:8px;font-weight:bold;font-size:1.5em;">'
+        f'{label}</span>'
     )
 
 
@@ -637,32 +639,66 @@ with tab_cloud:
             st.markdown("---")
             st.subheader("Cloud Test Results")
 
-            for r in results:
-                verdict = r.get("verdict", "REVIEW")
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    st.markdown(_cloud_verdict_badge(verdict), unsafe_allow_html=True)
-                with col2:
-                    st.markdown(f"**Device:** {r['device']} — API {r['api_level']}")
-                    st.markdown(f"**Verdict:** {r['verdict_reason']}")
+            for r_idx, r in enumerate(results):
+                verdict = r.get("verdict", "FAIL")
+                summary = r.get("verdict_summary", "")
+                root_causes = r.get("root_causes", [])
 
-                # Video
-                if r.get("video_url"):
-                    with st.expander("🎬 Test Video"):
-                        st.video(r["video_url"])
+                # 1. Big verdict badge
+                st.markdown(_cloud_verdict_badge(verdict), unsafe_allow_html=True)
 
-                # Screenshots
+                # 2. One-line summary
+                st.markdown(f"### {summary}")
+                st.caption(f"Device: {r['device']} — API {r['api_level']}")
+
+                # 3. Root cause details
+                if root_causes:
+                    st.subheader("Root Cause Analysis")
+                    for rc_idx, rc in enumerate(root_causes):
+                        with st.expander(
+                            f"🔴 {rc['category_label']}",
+                            expanded=True,
+                        ):
+                            st.markdown(f"**{rc['description']}**")
+                            st.markdown("---")
+
+                            # Evidence logcat lines
+                            st.markdown("**Evidence (logcat lines):**")
+                            st.code(
+                                "\n".join(rc["evidence"]),
+                                language="text",
+                            )
+
+                            st.markdown("---")
+                            st.info(f"**Recommendation:** {rc['recommendation']}")
+                elif verdict == "PASS":
+                    st.success(
+                        "No anti-sideload mechanisms detected. The app launched "
+                        "and ran normally without Play Store redirects, license "
+                        "checks, or integrity enforcement."
+                    )
+
+                # 4. Screenshots gallery
                 if r.get("screenshot_urls"):
                     with st.expander(f"📸 Screenshots ({len(r['screenshot_urls'])})"):
                         cols = st.columns(min(len(r["screenshot_urls"]), 3))
                         for idx, url in enumerate(r["screenshot_urls"]):
                             cols[idx % 3].image(url)
 
-                # Logcat
-                if r.get("logcat_url"):
-                    st.markdown(f"[📋 View Logcat]({r['logcat_url']})")
+                # Video
+                if r.get("video_url"):
+                    with st.expander("🎬 Test Video"):
+                        st.video(r["video_url"])
 
-            # JSON download
+                # 5. Collapsible logcat excerpt
+                logcat_excerpt = r.get("logcat_excerpt", "")
+                if logcat_excerpt:
+                    with st.expander("📋 Logcat Excerpt"):
+                        st.code(logcat_excerpt, language="text")
+                        if r.get("logcat_url"):
+                            st.markdown(f"[Download full logcat]({r['logcat_url']})")
+
+            # 6. Download JSON Report
             cloud_report = {
                 "test_run": {
                     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -670,7 +706,26 @@ with tab_cloud:
                     "project": ftl.project_id,
                     "apk": st.session_state.get("cloud_apk_name", ""),
                 },
-                "results": results,
+                "results": [
+                    {
+                        "device": r["device"],
+                        "api_level": r["api_level"],
+                        "verdict": r["verdict"],
+                        "verdict_summary": r.get("verdict_summary", ""),
+                        "root_causes": [
+                            {
+                                "category": rc["category"],
+                                "description": rc["description"],
+                                "evidence": rc["evidence"],
+                                "recommendation": rc["recommendation"],
+                            }
+                            for rc in r.get("root_causes", [])
+                        ],
+                        "logcat_excerpt": r.get("logcat_excerpt", ""),
+                        "screenshots": r.get("screenshot_urls", []),
+                    }
+                    for r in results
+                ],
             }
             st.download_button(
                 "📥 Download JSON Report",
