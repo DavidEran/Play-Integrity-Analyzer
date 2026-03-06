@@ -91,6 +91,43 @@ def _find_binary(name):
     return None
 
 
+def _detect_proxy():
+    """Detect proxy settings from environment (JAVA_TOOL_OPTIONS or env vars).
+
+    Returns (proxy_type, host, port) or (None, None, None).
+    """
+    # Check JAVA_TOOL_OPTIONS first (set by many CI/container environments)
+    java_opts = os.environ.get("JAVA_TOOL_OPTIONS", "")
+    for prefix in ("-Dhttps.proxyHost=", "-Dhttp.proxyHost="):
+        if prefix in java_opts:
+            host = java_opts.split(prefix)[1].split(" ")[0].split("-D")[0].strip()
+            port_prefix = prefix.replace("proxyHost", "proxyPort")
+            port = "8080"
+            if port_prefix in java_opts:
+                port = java_opts.split(port_prefix)[1].split(" ")[0].split("-D")[0].strip()
+            scheme = "https" if "https" in prefix else "http"
+            return scheme, host, port
+    # Check standard env vars
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        val = os.environ.get(var, "")
+        if val:
+            val = re.sub(r"^https?://", "", val)
+            parts = val.split(":")
+            host = parts[0]
+            port = parts[1].rstrip("/") if len(parts) > 1 else "8080"
+            scheme = "https" if "https" in var.lower() else "http"
+            return scheme, host, port
+    return None, None, None
+
+
+def _sdkmanager_proxy_args():
+    """Return sdkmanager CLI args for proxy, if a proxy is detected."""
+    scheme, host, port = _detect_proxy()
+    if host:
+        return [f"--proxy={scheme}", f"--proxy_host={host}", f"--proxy_port={port}"]
+    return []
+
+
 def _run(cmd, env=None, timeout=600):
     """Run a command and return (returncode, stdout, stderr)."""
     merged_env = os.environ.copy()
@@ -112,7 +149,8 @@ def _run(cmd, env=None, timeout=600):
 
 
 def _download_file(url, dest, progress_callback=None):
-    """Download a file with optional progress reporting."""
+    """Download a file with optional progress reporting. Respects proxy env vars."""
+    # urllib automatically uses HTTP_PROXY / HTTPS_PROXY env vars via ProxyHandler
     def _hook(block_num, block_size, total_size):
         if progress_callback and total_size > 0:
             downloaded = block_num * block_size
@@ -121,7 +159,13 @@ def _download_file(url, dest, progress_callback=None):
             mb_total = total_size // (1024 * 1024)
             progress_callback(f"Downloading... {pct}% ({mb_down}MB / {mb_total}MB)")
 
-    urllib.request.urlretrieve(url, str(dest), reporthook=_hook)
+    try:
+        urllib.request.urlretrieve(url, str(dest), reporthook=_hook)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to download {url}: {e}\n"
+            f"Make sure dl.google.com is accessible from this server."
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +222,10 @@ def _accept_licenses():
     env["ANDROID_SDK_ROOT"] = str(_SDK_DIR)
     env["ANDROID_AVD_HOME"] = str(_AVD_DIR)
     env["ANDROID_PREFS_ROOT"] = str(_SDK_DIR / ".android")
+    proxy_args = _sdkmanager_proxy_args()
     try:
         proc = subprocess.Popen(
-            [sdkmanager, "--licenses", f"--sdk_root={_SDK_DIR}"],
+            [sdkmanager, "--licenses", f"--sdk_root={_SDK_DIR}"] + proxy_args,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env,
         )
@@ -205,22 +250,31 @@ def _install_sdk_packages(progress_callback=None):
         _SYS_IMAGE_PACKAGE,
     ]
 
+    proxy_args = _sdkmanager_proxy_args()
+    if proxy_args and progress_callback:
+        progress_callback(f"Detected proxy: {proxy_args[1]}")
+
     for pkg in packages:
         if progress_callback:
             progress_callback(f"Installing {pkg}...")
         rc, out, err = _run(
-            [sdkmanager, f"--sdk_root={_SDK_DIR}", "--install", pkg],
+            [sdkmanager, f"--sdk_root={_SDK_DIR}", "--install", pkg] + proxy_args,
             timeout=600,
         )
         if rc != 0:
-            # Retry once
+            # Retry once with fresh license acceptance
             _accept_licenses()
             rc, out, err = _run(
-                [sdkmanager, f"--sdk_root={_SDK_DIR}", "--install", pkg],
+                [sdkmanager, f"--sdk_root={_SDK_DIR}", "--install", pkg] + proxy_args,
                 timeout=600,
             )
             if rc != 0:
-                raise RuntimeError(f"Failed to install {pkg}: {err[:500]}")
+                raise RuntimeError(
+                    f"Failed to install {pkg}.\n\n"
+                    f"sdkmanager stderr:\n{err[:800]}\n\n"
+                    f"This usually means the network blocked the download. "
+                    f"Make sure dl.google.com is accessible from this server."
+                )
 
 
 def _create_avd(progress_callback=None):
