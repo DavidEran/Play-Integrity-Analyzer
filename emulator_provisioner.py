@@ -546,3 +546,115 @@ def get_emulator_status():
         "emulator_running": len(running) > 0,
         "running_serial": running[0] if running else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Background provisioning (for Streamlit compatibility)
+# ---------------------------------------------------------------------------
+
+_STATUS_FILE = _SDK_DIR / ".provision_status.json"
+
+
+def _write_status(state, message, error=None):
+    """Write provisioning status to a JSON file."""
+    import json as _json
+    _SDK_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"state": state, "message": message, "timestamp": time.time()}
+    if error:
+        data["error"] = error
+    _STATUS_FILE.write_text(_json.dumps(data))
+
+
+def read_provision_status():
+    """Read the current provisioning status.
+
+    Returns:
+        {"state": "idle"|"running"|"done"|"error", "message": str, "error": str|None}
+        or None if no status file exists.
+    """
+    import json as _json
+    if not _STATUS_FILE.exists():
+        return None
+    try:
+        return _json.loads(_STATUS_FILE.read_text())
+    except Exception:
+        return None
+
+
+def clear_provision_status():
+    """Remove the status file (reset state to idle)."""
+    _STATUS_FILE.unlink(missing_ok=True)
+
+
+def start_provision_background():
+    """Launch provisioning in a background subprocess.
+
+    Returns immediately. Poll with read_provision_status().
+    """
+    if is_provisioned():
+        _write_status("done", "Already provisioned.")
+        return
+
+    # Check if already running
+    status = read_provision_status()
+    if status and status.get("state") == "running":
+        # Check if the process is actually still alive (stale status)
+        elapsed = time.time() - status.get("timestamp", 0)
+        if elapsed < 900:  # 15 min — generous timeout
+            return  # Still running, don't launch another
+
+    _write_status("running", "Starting provisioning...")
+
+    # Launch a subprocess that runs this module's __main__ block
+    subprocess.Popen(
+        [sys.executable, __file__, "--provision"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def start_boot_background():
+    """Launch emulator boot in a background subprocess.
+
+    Returns immediately. Poll with read_provision_status().
+    """
+    running = _get_running_emulators()
+    if running:
+        _write_status("done", f"Emulator already running: {running[0]}")
+        return
+
+    status = read_provision_status()
+    if status and status.get("state") == "running":
+        elapsed = time.time() - status.get("timestamp", 0)
+        if elapsed < 300:
+            return
+
+    _write_status("running", "Starting emulator...")
+
+    subprocess.Popen(
+        [sys.executable, __file__, "--boot"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point (used by background subprocess)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    if len(_sys.argv) > 1 and _sys.argv[1] == "--provision":
+        try:
+            provision_emulator(progress_callback=lambda msg: _write_status("running", msg))
+            _write_status("done", "Provisioning complete!")
+        except Exception as e:
+            _write_status("error", str(e), error=str(e))
+
+    elif len(_sys.argv) > 1 and _sys.argv[1] == "--boot":
+        try:
+            serial = boot_emulator(progress_callback=lambda msg: _write_status("running", msg))
+            _write_status("done", f"Emulator ready: {serial}")
+        except Exception as e:
+            _write_status("error", str(e), error=str(e))

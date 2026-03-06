@@ -241,36 +241,50 @@ with tab_sideload:
     )
 
     from emulator_provisioner import (
-        get_emulator_status, provision_emulator, boot_emulator,
-        shutdown_emulator, is_provisioned,
+        get_emulator_status, shutdown_emulator, is_provisioned,
+        start_provision_background, start_boot_background,
+        read_provision_status, clear_provision_status,
     )
     import sideload_test as st_mod
 
     # Check current state
     emu_status = get_emulator_status()
+    bg_status = read_provision_status()
+
+    # ---- Background task in progress? Show status and auto-refresh ----
+    if bg_status and bg_status.get("state") == "running":
+        st.info(f"⏳ {bg_status.get('message', 'Working...')}")
+        st.caption("This page refreshes automatically every 3 seconds.")
+        time.sleep(3)
+        st.rerun()
+
+    elif bg_status and bg_status.get("state") == "error":
+        st.error(f"Setup failed: {bg_status.get('error', 'Unknown error')}")
+        if st.button("🔄 Retry Setup", key="retry_provision"):
+            clear_provision_status()
+            st.rerun()
+
+    elif bg_status and bg_status.get("state") == "done" and not emu_status["avd_exists"]:
+        # Done message but AVD not detected yet — clear and refresh
+        clear_provision_status()
+        st.rerun()
+
+    elif bg_status and bg_status.get("state") == "done":
+        # Show done briefly then clear
+        st.success(f"✅ {bg_status.get('message', 'Done!')}")
+        clear_provision_status()
 
     # ---- Step 1: One-time setup (download SDK + emulator) ----
-    if not emu_status["avd_exists"]:
+    if not emu_status["avd_exists"] and (not bg_status or bg_status.get("state") not in ("running",)):
         st.info(
             "**First-time setup required.** The tool needs to download an Android emulator (~2 GB). "
             "This only happens once — after that, tests start instantly."
         )
         if st.button("⬇️ Download & Set Up Emulator", key="provision_emu", type="primary"):
-            setup_status = st.status("Setting up Android emulator...", expanded=True)
-            with setup_status:
-                try:
-                    provision_emulator(
-                        progress_callback=lambda msg: st.write(msg)
-                    )
-                    st.write("✅ Setup complete!")
-                    setup_status.update(label="Setup complete!", state="complete")
-                    st.session_state["emu_provisioned"] = True
-                    st.rerun()
-                except RuntimeError as e:
-                    st.error(f"Setup failed: {e}")
-                    setup_status.update(label="Setup failed", state="error")
+            start_provision_background()
+            st.rerun()
 
-    else:
+    elif emu_status["avd_exists"]:
         # ---- Step 2: Emulator is provisioned, manage its lifecycle ----
         if emu_status["emulator_running"]:
             serial = emu_status["running_serial"]
@@ -283,23 +297,12 @@ with tab_sideload:
                 if st.button("⏹️ Stop Emulator", key="stop_emu"):
                     shutdown_emulator(serial)
                     st.rerun()
-        else:
+        elif not bg_status or bg_status.get("state") != "running":
             serial = None
             st.warning("Virtual device is not running.")
             if st.button("▶️ Start Virtual Device", key="start_emu", type="primary"):
-                boot_status = st.status("Starting virtual device...", expanded=True)
-                with boot_status:
-                    try:
-                        serial = boot_emulator(
-                            progress_callback=lambda msg: st.write(msg)
-                        )
-                        st.write(f"✅ Ready: `{serial}`")
-                        boot_status.update(label="Virtual device ready!", state="complete")
-                        st.session_state["emu_serial"] = serial
-                        st.rerun()
-                    except RuntimeError as e:
-                        st.error(f"Failed to start: {e}")
-                        boot_status.update(label="Start failed", state="error")
+                start_boot_background()
+                st.rerun()
 
         # ---- Step 3: Upload & test APKs (only when emulator is running) ----
         if emu_status["emulator_running"]:
