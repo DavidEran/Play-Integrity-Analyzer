@@ -235,6 +235,24 @@ def _accept_licenses():
         pass
 
 
+def _check_connectivity(progress_callback=None):
+    """Quick check that dl.google.com is reachable before attempting large downloads."""
+    import urllib.error
+    test_url = "https://dl.google.com/android/repository/repository2-3.xml"
+    try:
+        req = urllib.request.Request(test_url, method="HEAD")
+        urllib.request.urlopen(req, timeout=15)
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(
+            f"Cannot reach dl.google.com (Android SDK download server).\n"
+            f"Error: {e}\n\n"
+            f"This server's network must allow outbound HTTPS to dl.google.com.\n"
+            f"If you're behind a corporate proxy or firewall, add dl.google.com to the allowlist."
+        ) from e
+    if progress_callback:
+        progress_callback("Connectivity check passed (dl.google.com reachable)")
+
+
 def _install_sdk_packages(progress_callback=None):
     """Install emulator, platform-tools, and system image via sdkmanager."""
     sdkmanager = _find_binary("sdkmanager")
@@ -269,9 +287,11 @@ def _install_sdk_packages(progress_callback=None):
                 timeout=600,
             )
             if rc != 0:
+                # sdkmanager often prints errors to stdout, not stderr
+                output = (err.strip() or out.strip() or "(no output)")[:800]
                 raise RuntimeError(
                     f"Failed to install {pkg}.\n\n"
-                    f"sdkmanager stderr:\n{err[:800]}\n\n"
+                    f"sdkmanager output:\n{output}\n\n"
                     f"This usually means the network blocked the download. "
                     f"Make sure dl.google.com is accessible from this server."
                 )
@@ -478,7 +498,7 @@ def provision_emulator(progress_callback=None):
     """Full provisioning: download SDK tools, install packages, create AVD.
 
     This is idempotent — skips steps that are already done.
-    Takes ~2-3 GB of disk space on first run.
+    Takes ~2 GB of disk space on first run.
 
     Args:
         progress_callback: Optional callable(message: str) for status updates.
@@ -487,6 +507,9 @@ def provision_emulator(progress_callback=None):
         if progress_callback:
             progress_callback("Android SDK and emulator already provisioned.")
         return
+
+    # Step 0: Verify network connectivity before downloading anything
+    _check_connectivity(progress_callback)
 
     # Step 1: Command-line tools
     if not _find_binary("sdkmanager"):

@@ -252,7 +252,7 @@ with tab_sideload:
     # ---- Step 1: One-time setup (download SDK + emulator) ----
     if not emu_status["avd_exists"]:
         st.info(
-            "**First-time setup required.** The tool needs to download an Android emulator (~3 GB). "
+            "**First-time setup required.** The tool needs to download an Android emulator (~2 GB). "
             "This only happens once — after that, tests start instantly."
         )
         if st.button("⬇️ Download & Set Up Emulator", key="provision_emu", type="primary"):
