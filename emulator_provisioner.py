@@ -135,6 +135,14 @@ def _run(cmd, env=None, timeout=600):
     merged_env["ANDROID_AVD_HOME"] = str(_AVD_DIR)
     # Suppress telemetry/analytics prompts
     merged_env["ANDROID_PREFS_ROOT"] = str(_SDK_DIR / ".android")
+    # Ensure JAVA_HOME is set for sdkmanager/avdmanager
+    if not merged_env.get("JAVA_HOME"):
+        java_bin = shutil.which("java")
+        if java_bin:
+            java_real = os.path.realpath(java_bin)
+            java_home = os.path.dirname(os.path.dirname(java_real))
+            if os.path.isdir(java_home):
+                merged_env["JAVA_HOME"] = java_home
     if env:
         merged_env.update(env)
     try:
@@ -555,6 +563,30 @@ def get_emulator_status():
 _STATUS_FILE = _SDK_DIR / ".provision_status.json"
 
 
+def _build_subprocess_env():
+    """Build an environment dict for background subprocesses.
+
+    Ensures JAVA_HOME is set and PATH includes the java binary directory,
+    since detached subprocesses may not inherit the full shell environment.
+    """
+    env = os.environ.copy()
+    env["ANDROID_SDK_ROOT"] = str(_SDK_DIR)
+    env["ANDROID_AVD_HOME"] = str(_AVD_DIR)
+    env["ANDROID_PREFS_ROOT"] = str(_SDK_DIR / ".android")
+
+    # Set JAVA_HOME if not already set
+    if not env.get("JAVA_HOME"):
+        java_bin = shutil.which("java")
+        if java_bin:
+            # java is typically at JAVA_HOME/bin/java
+            java_real = os.path.realpath(java_bin)
+            java_home = os.path.dirname(os.path.dirname(java_real))
+            if os.path.isdir(java_home):
+                env["JAVA_HOME"] = java_home
+
+    return env
+
+
 def _write_status(state, message, error=None):
     """Write provisioning status to a JSON file."""
     import json as _json
@@ -610,6 +642,7 @@ def start_provision_background():
         [sys.executable, __file__, "--provision"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=_build_subprocess_env(),
     )
 
 
@@ -635,6 +668,7 @@ def start_boot_background():
         [sys.executable, __file__, "--boot"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=_build_subprocess_env(),
     )
 
 
