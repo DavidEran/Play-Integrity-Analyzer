@@ -698,6 +698,45 @@ with tab_cloud:
                         if r.get("logcat_url"):
                             st.markdown(f"[Download full logcat]({r['logcat_url']})")
 
+                # 6. Debug expander
+                debug = r.get("debug", {})
+                with st.expander("🐛 Debug Info"):
+                    st.markdown(f"**GCS results path:** `{debug.get('gcs_path', 'N/A')}`")
+                    st.markdown(f"**Execution subdir:** `{debug.get('exec_subdir', 'N/A')}`")
+                    st.markdown(f"**Logcat file:** `{debug.get('logcat_file', 'not found')}`")
+                    st.markdown(f"**Logcat size:** {debug.get('logcat_size', 0):,} chars")
+
+                    # All files in GCS path
+                    all_files = debug.get("all_files", [])
+                    st.markdown(f"**All files in GCS path ({len(all_files)}):**")
+                    if all_files:
+                        st.code("\n".join(all_files), language="text")
+                    else:
+                        st.warning("No files found in GCS results path!")
+
+                    # Execution-specific blobs
+                    exec_blobs = debug.get("execution_blobs", [])
+                    st.markdown(f"**Execution blobs ({len(exec_blobs)}):**")
+                    if exec_blobs:
+                        st.code("\n".join(exec_blobs), language="text")
+
+                    # Broad keyword matches
+                    broad = debug.get("broad_matches", {})
+                    if broad:
+                        st.markdown("**Broad keyword matches (case-insensitive):**")
+                        for kw, count in sorted(broad.items(), key=lambda x: -x[1]):
+                            st.markdown(f"- `{kw}`: **{count}** occurrences")
+                    else:
+                        st.warning("No broad keyword matches found in logcat.")
+
+                    # Raw logcat preview
+                    raw_preview = debug.get("logcat_raw_preview", "")
+                    if raw_preview:
+                        st.markdown(f"**Raw logcat preview (first {len(raw_preview):,} chars):**")
+                        st.code(raw_preview[:50000], language="text")
+                    else:
+                        st.error("Logcat text is EMPTY — artifact download failed.")
+
             # 6. Download JSON Report
             cloud_report = {
                 "test_run": {

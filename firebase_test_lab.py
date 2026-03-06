@@ -247,70 +247,28 @@ class FirebaseTestLab:
 
     # -- result parsing with root-cause analysis ------------------------------
 
-    def _resolve_results_dir(self, matrix: dict, execution: dict) -> str:
-        """Find the GCS results directory for an execution.
-
-        Firebase Test Lab stores results at a path like:
-            gs://bucket/results/<matrixId>/<executionId>/
-        The ``resultStorage`` field lives on the **matrix**, not on
-        individual executions.  We combine the matrix-level GCS prefix
-        with the execution's ``id`` (or ``toolResultsStep.executionId``)
-        to build the full path.
-        """
-        # 1. Matrix-level resultStorage (always present)
-        matrix_gcs = (
-            matrix.get("resultStorage", {})
-            .get("googleCloudStorage", {})
-            .get("gcsPath", "")
-        )
-        if not matrix_gcs:
-            return ""
-
-        # Normalise trailing slash
-        if not matrix_gcs.endswith("/"):
-            matrix_gcs += "/"
-
-        # 2. Try to find the execution-specific subdirectory.
-        #    The API nests results under <matrixId>/<executionId>/
-        exec_id = execution.get("id", "")
-        matrix_id = matrix.get("testMatrixId", "")
-
-        # Try the most specific path first, then fall back
-        candidates = []
-        if matrix_id and exec_id:
-            candidates.append(f"{matrix_gcs}{matrix_id}/{exec_id}/")
-        if matrix_id:
-            candidates.append(f"{matrix_gcs}{matrix_id}/")
-        candidates.append(matrix_gcs)
-
-        # Check which prefix actually has blobs in it
-        for candidate in candidates:
-            if not candidate.startswith("gs://"):
-                continue
-            path = candidate[5:]
-            parts = path.split("/", 1)
-            bucket_name = parts[0]
-            prefix = parts[1] if len(parts) > 1 else ""
-            try:
-                bucket = self._storage.bucket(bucket_name)
-                # Just check if there's at least one blob
-                page = bucket.list_blobs(prefix=prefix, max_results=1)
-                if any(True for _ in page):
-                    return candidate
-            except Exception:
-                continue
-
-        # Fall back to the matrix-level path even if empty
-        return matrix_gcs
-
     def parse_results(self, matrix: dict) -> list[dict]:
         """Convert a finished testMatrix into result dicts with root-cause
         analysis based on downloaded logcat and activity transitions.
 
         Each dict has keys: device, api_level, outcome, verdict,
         verdict_summary, root_causes, logcat_excerpt, video_url,
-        screenshot_urls, logcat_url, duration_seconds.
+        screenshot_urls, logcat_url, duration_seconds, debug.
         """
+        # 1. Get the matrix-level GCS results path — this is the ONLY place
+        #    Firebase puts it; individual executions do NOT have resultStorage.
+        matrix_gcs = (
+            matrix.get("resultStorage", {})
+            .get("googleCloudStorage", {})
+            .get("gcsPath", "")
+        )
+
+        # 2. List ALL blobs under that path once (shared across executions)
+        all_blobs, bucket_name, prefix = self._list_all_result_blobs(matrix_gcs)
+
+        # Build a file listing for debug
+        all_blob_paths = [b.name for b in all_blobs]
+
         results = []
         for execution in matrix.get("testExecutions", []):
             env = execution.get("environment", {}).get("androidDevice", {})
@@ -338,13 +296,43 @@ class FirebaseTestLab:
                     "screenshot_urls": [],
                     "logcat_url": None,
                     "duration_seconds": 0,
+                    "debug": {
+                        "gcs_path": matrix_gcs,
+                        "all_files": all_blob_paths,
+                        "execution_blobs": [],
+                        "logcat_size": 0,
+                        "broad_matches": {},
+                    },
                 })
                 continue
 
-            # Resolve the correct GCS directory for this execution
-            results_dir = self._resolve_results_dir(matrix, execution)
-            artifacts = self._collect_artifacts(results_dir)
+            # Firebase Test Lab stores execution results in a subdirectory
+            # named {modelId}-{apiLevel}-{locale}-{orientation}
+            # e.g. "shiba-34-en-portrait/"
+            locale = env.get("locale", "en")
+            orientation = env.get("orientation", "portrait")
+            exec_subdir = f"{device_id}-{api_level}-{locale}-{orientation}"
+
+            # Filter blobs for this execution's subdirectory
+            exec_blobs = [
+                b for b in all_blobs
+                if f"/{exec_subdir}/" in f"/{b.name}/"
+                or b.name.startswith(f"{prefix}{exec_subdir}/")
+            ]
+
+            # If no execution-specific blobs found, fall back to ALL blobs
+            # (single-device test might not have subdirectories)
+            if not exec_blobs:
+                exec_blobs = all_blobs
+
+            exec_blob_paths = [b.name for b in exec_blobs]
+
+            # Collect artifacts from the execution's blobs
+            artifacts = self._collect_artifacts_from_blobs(exec_blobs)
             logcat_text = artifacts.get("logcat_text", "")
+
+            # Run broad keyword scan for debug
+            broad_matches = _broad_keyword_scan(logcat_text)
 
             # Run root-cause analysis on the logcat
             root_causes = _analyze_logcat(logcat_text)
@@ -358,7 +346,7 @@ class FirebaseTestLab:
                 r"Process.*?has died|Force finishing activity",
                 re.IGNORECASE,
             )
-            has_crash = bool(crash_patterns.search(logcat_text))
+            has_crash = bool(crash_patterns.search(logcat_text)) if logcat_text else False
 
             if has_blocking:
                 verdict = "FAIL"
@@ -388,90 +376,134 @@ class FirebaseTestLab:
                 "screenshot_urls": artifacts.get("screenshots", []),
                 "logcat_url": artifacts.get("logcat_url"),
                 "duration_seconds": 0,
+                "debug": {
+                    "gcs_path": matrix_gcs,
+                    "exec_subdir": exec_subdir,
+                    "all_files": all_blob_paths,
+                    "execution_blobs": exec_blob_paths,
+                    "logcat_file": artifacts.get("logcat_blob_name", ""),
+                    "logcat_size": len(logcat_text),
+                    "broad_matches": broad_matches,
+                    "logcat_raw_preview": logcat_text[:50000] if logcat_text else "",
+                },
             })
 
         return results
 
-    def _collect_artifacts(self, gcs_dir: str) -> dict:
-        """Download logcat text and collect signed URLs for media artifacts.
+    def _list_all_result_blobs(self, gcs_path: str):
+        """List all blobs under a gs:// path.
 
-        Firebase Test Lab stores results with names like:
-            logcat, logcat.txt, bugreport.txt, video.mp4,
-            screen-0.png, screen-1.png, ...
-        They may also be nested in subdirectories like
-            test_cases/<testname>/ or artifacts/.
-        We recursively list all blobs under the prefix and classify them.
+        Returns (blobs_list, bucket_name, prefix).
+        """
+        if not gcs_path or not gcs_path.startswith("gs://"):
+            return [], "", ""
+
+        path = gcs_path[5:]  # strip "gs://"
+        if not path:
+            return [], "", ""
+
+        parts = path.split("/", 1)
+        bucket_name = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ""
+
+        # Normalise: ensure trailing slash on prefix
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+
+        try:
+            bucket = self._storage.bucket(bucket_name)
+            blobs = list(bucket.list_blobs(prefix=prefix, max_results=1000))
+            return blobs, bucket_name, prefix
+        except Exception:
+            return [], bucket_name, prefix
+
+    def _collect_artifacts_from_blobs(self, blobs: list) -> dict:
+        """Given a pre-filtered list of GCS blobs, download logcat and
+        collect signed URLs for screenshots and video.
+
+        Firebase Test Lab typical file structure per execution:
+            {device-dir}/logcat
+            {device-dir}/video.mp4
+            {device-dir}/artifacts/screenshot0001.png
+            {device-dir}/artifacts/screenshot0002.png
+            {device-dir}/test_cases/.../logcat
         """
         artifacts = {
             "screenshots": [],
             "video": None,
             "logcat_url": None,
             "logcat_text": "",
+            "logcat_blob_name": "",
         }
 
-        if not gcs_dir or not gcs_dir.startswith("gs://"):
+        if not blobs:
             return artifacts
 
-        path = gcs_dir[5:]  # strip "gs://"
-        parts = path.split("/", 1)
-        bucket_name = parts[0]
-        prefix = parts[1] if len(parts) > 1 else ""
+        logcat_candidates = []
 
-        try:
-            bucket = self._storage.bucket(bucket_name)
-            blobs = list(bucket.list_blobs(prefix=prefix, max_results=500))
+        for blob in blobs:
+            name_lower = blob.name.lower()
+            basename = name_lower.rsplit("/", 1)[-1]
 
-            logcat_candidates = []
+            # Video
+            if basename.endswith(".mp4") or basename.startswith("video"):
+                if artifacts["video"] is None:
+                    artifacts["video"] = blob.generate_signed_url(
+                        expiration=3600,
+                    )
 
-            for blob in blobs:
-                name_lower = blob.name.lower()
-                basename = name_lower.rsplit("/", 1)[-1]
-
-                # Video
-                if basename.endswith(".mp4") or basename.startswith("video"):
-                    if artifacts["video"] is None:
-                        artifacts["video"] = blob.generate_signed_url(
-                            expiration=3600,
-                        )
-
-                # Screenshots
-                elif basename.endswith((".png", ".jpg", ".jpeg")):
+            # Screenshots — match .png/.jpg but NOT instrumentation/icon PNGs
+            elif basename.endswith((".png", ".jpg", ".jpeg")):
+                # Only include files that look like screenshots
+                # (in artifacts/ dir, or named screenshot*, screen-*)
+                if (
+                    "/artifacts/" in blob.name.lower()
+                    or "screenshot" in basename
+                    or "screen" in basename
+                    or basename.startswith("screenshot")
+                ):
                     artifacts["screenshots"].append(
                         blob.generate_signed_url(expiration=3600)
                     )
 
-                # Logcat — collect all candidates, pick the best one after
-                elif (
-                    basename in ("logcat", "logcat.txt")
-                    or basename.startswith("logcat")
-                    or "logcat" in basename
-                ) and not basename.endswith((".png", ".jpg", ".mp4")):
+            # Logcat — any file named logcat or logcat.txt, anywhere in tree
+            elif (
+                basename in ("logcat", "logcat.txt")
+                or basename.startswith("logcat")
+            ) and not basename.endswith((".png", ".jpg", ".mp4")):
+                logcat_candidates.append(blob)
+
+        # Also do a second pass: grab ANY text file that might be logcat
+        # if the first pass found nothing (some runs name it differently)
+        if not logcat_candidates:
+            for blob in blobs:
+                basename = blob.name.rsplit("/", 1)[-1].lower()
+                if basename.endswith(".txt") and blob.size and blob.size > 1000:
                     logcat_candidates.append(blob)
 
-            # Pick the largest logcat file (most complete)
-            if logcat_candidates:
-                logcat_candidates.sort(
-                    key=lambda b: b.size or 0, reverse=True,
+        # Pick the largest logcat file (most complete)
+        if logcat_candidates:
+            logcat_candidates.sort(
+                key=lambda b: b.size or 0, reverse=True,
+            )
+            best_logcat = logcat_candidates[0]
+            artifacts["logcat_blob_name"] = best_logcat.name
+            artifacts["logcat_url"] = best_logcat.generate_signed_url(
+                expiration=3600,
+            )
+            # Download the logcat text
+            try:
+                artifacts["logcat_text"] = best_logcat.download_as_text(
+                    encoding="utf-8",
                 )
-                best_logcat = logcat_candidates[0]
-                artifacts["logcat_url"] = best_logcat.generate_signed_url(
-                    expiration=3600,
-                )
+            except Exception:
                 try:
-                    artifacts["logcat_text"] = best_logcat.download_as_text(
-                        encoding="utf-8",
+                    raw = best_logcat.download_as_bytes()
+                    artifacts["logcat_text"] = raw.decode(
+                        "utf-8", errors="replace",
                     )
                 except Exception:
-                    try:
-                        raw = best_logcat.download_as_bytes()
-                        artifacts["logcat_text"] = raw.decode(
-                            "utf-8", errors="replace",
-                        )
-                    except Exception:
-                        pass
-
-        except Exception:
-            pass  # Artifacts are best-effort
+                    artifacts["logcat_text"] = ""
 
         return artifacts
 
@@ -634,6 +666,27 @@ _DETECTION_CATEGORIES = [
         ),
     },
 ]
+
+
+_BROAD_KEYWORDS = [
+    "integrity", "license", "licensed", "vending", "protect",
+    "attestation", "appcheck", "market://", "play.google.com",
+    "DENY", "blocked", "verify", "NOT_LICENSED", "AutoProtect",
+    "IntegrityService", "LicenseChecker", "getInstallingPackageName",
+]
+
+
+def _broad_keyword_scan(logcat_text: str) -> dict[str, int]:
+    """Case-insensitive scan for broad keywords. Returns {keyword: count}."""
+    if not logcat_text:
+        return {}
+    text_lower = logcat_text.lower()
+    matches = {}
+    for kw in _BROAD_KEYWORDS:
+        count = text_lower.count(kw.lower())
+        if count > 0:
+            matches[kw] = count
+    return matches
 
 
 def _analyze_logcat(logcat_text: str) -> list[dict]:
