@@ -247,6 +247,62 @@ class FirebaseTestLab:
 
     # -- result parsing with root-cause analysis ------------------------------
 
+    def _resolve_results_dir(self, matrix: dict, execution: dict) -> str:
+        """Find the GCS results directory for an execution.
+
+        Firebase Test Lab stores results at a path like:
+            gs://bucket/results/<matrixId>/<executionId>/
+        The ``resultStorage`` field lives on the **matrix**, not on
+        individual executions.  We combine the matrix-level GCS prefix
+        with the execution's ``id`` (or ``toolResultsStep.executionId``)
+        to build the full path.
+        """
+        # 1. Matrix-level resultStorage (always present)
+        matrix_gcs = (
+            matrix.get("resultStorage", {})
+            .get("googleCloudStorage", {})
+            .get("gcsPath", "")
+        )
+        if not matrix_gcs:
+            return ""
+
+        # Normalise trailing slash
+        if not matrix_gcs.endswith("/"):
+            matrix_gcs += "/"
+
+        # 2. Try to find the execution-specific subdirectory.
+        #    The API nests results under <matrixId>/<executionId>/
+        exec_id = execution.get("id", "")
+        matrix_id = matrix.get("testMatrixId", "")
+
+        # Try the most specific path first, then fall back
+        candidates = []
+        if matrix_id and exec_id:
+            candidates.append(f"{matrix_gcs}{matrix_id}/{exec_id}/")
+        if matrix_id:
+            candidates.append(f"{matrix_gcs}{matrix_id}/")
+        candidates.append(matrix_gcs)
+
+        # Check which prefix actually has blobs in it
+        for candidate in candidates:
+            if not candidate.startswith("gs://"):
+                continue
+            path = candidate[5:]
+            parts = path.split("/", 1)
+            bucket_name = parts[0]
+            prefix = parts[1] if len(parts) > 1 else ""
+            try:
+                bucket = self._storage.bucket(bucket_name)
+                # Just check if there's at least one blob
+                page = bucket.list_blobs(prefix=prefix, max_results=1)
+                if any(True for _ in page):
+                    return candidate
+            except Exception:
+                continue
+
+        # Fall back to the matrix-level path even if empty
+        return matrix_gcs
+
     def parse_results(self, matrix: dict) -> list[dict]:
         """Convert a finished testMatrix into result dicts with root-cause
         analysis based on downloaded logcat and activity transitions.
@@ -285,12 +341,8 @@ class FirebaseTestLab:
                 })
                 continue
 
-            # Collect artifacts from GCS (logcat text + media URLs)
-            results_dir = (
-                execution.get("resultStorage", {})
-                .get("googleCloudStorage", {})
-                .get("gcsPath", "")
-            )
+            # Resolve the correct GCS directory for this execution
+            results_dir = self._resolve_results_dir(matrix, execution)
             artifacts = self._collect_artifacts(results_dir)
             logcat_text = artifacts.get("logcat_text", "")
 
@@ -298,14 +350,7 @@ class FirebaseTestLab:
             root_causes = _analyze_logcat(logcat_text)
 
             # Determine verdict
-            has_play_store_redirect = any(
-                rc["category"] in (
-                    "play_auto_protect", "play_licensing",
-                    "play_integrity_api", "installer_source_check",
-                    "firebase_app_check", "play_store_redirect",
-                )
-                for rc in root_causes
-            )
+            has_blocking = bool(root_causes)
 
             # Check for crash with no Play Store involvement
             crash_patterns = re.compile(
@@ -315,13 +360,13 @@ class FirebaseTestLab:
             )
             has_crash = bool(crash_patterns.search(logcat_text))
 
-            if has_play_store_redirect:
+            if has_blocking:
                 verdict = "FAIL"
                 categories = [rc["category_label"] for rc in root_causes]
                 verdict_summary = (
                     f"Sideload Blocked: {', '.join(categories)} detected"
                 )
-            elif has_crash and not has_play_store_redirect:
+            elif has_crash:
                 verdict = "FAIL"
                 verdict_summary = "App Crash — no Play Store involvement detected"
             else:
@@ -348,7 +393,15 @@ class FirebaseTestLab:
         return results
 
     def _collect_artifacts(self, gcs_dir: str) -> dict:
-        """Download logcat text and collect signed URLs for media artifacts."""
+        """Download logcat text and collect signed URLs for media artifacts.
+
+        Firebase Test Lab stores results with names like:
+            logcat, logcat.txt, bugreport.txt, video.mp4,
+            screen-0.png, screen-1.png, ...
+        They may also be nested in subdirectories like
+            test_cases/<testname>/ or artifacts/.
+        We recursively list all blobs under the prefix and classify them.
+        """
         artifacts = {
             "screenshots": [],
             "video": None,
@@ -366,39 +419,57 @@ class FirebaseTestLab:
 
         try:
             bucket = self._storage.bucket(bucket_name)
-            blobs = list(bucket.list_blobs(prefix=prefix, max_results=200))
+            blobs = list(bucket.list_blobs(prefix=prefix, max_results=500))
+
+            logcat_candidates = []
 
             for blob in blobs:
                 name_lower = blob.name.lower()
+                basename = name_lower.rsplit("/", 1)[-1]
 
-                if name_lower.endswith(".mp4") or "video" in name_lower:
-                    artifacts["video"] = blob.generate_signed_url(
-                        expiration=3600,
-                    )
-                elif name_lower.endswith(".png") or name_lower.endswith(".jpg"):
+                # Video
+                if basename.endswith(".mp4") or basename.startswith("video"):
+                    if artifacts["video"] is None:
+                        artifacts["video"] = blob.generate_signed_url(
+                            expiration=3600,
+                        )
+
+                # Screenshots
+                elif basename.endswith((".png", ".jpg", ".jpeg")):
                     artifacts["screenshots"].append(
                         blob.generate_signed_url(expiration=3600)
                     )
-                elif "logcat" in name_lower and not name_lower.endswith(
-                    (".png", ".jpg", ".mp4")
-                ):
-                    # Download the actual logcat text for analysis
-                    artifacts["logcat_url"] = blob.generate_signed_url(
-                        expiration=3600,
+
+                # Logcat — collect all candidates, pick the best one after
+                elif (
+                    basename in ("logcat", "logcat.txt")
+                    or basename.startswith("logcat")
+                    or "logcat" in basename
+                ) and not basename.endswith((".png", ".jpg", ".mp4")):
+                    logcat_candidates.append(blob)
+
+            # Pick the largest logcat file (most complete)
+            if logcat_candidates:
+                logcat_candidates.sort(
+                    key=lambda b: b.size or 0, reverse=True,
+                )
+                best_logcat = logcat_candidates[0]
+                artifacts["logcat_url"] = best_logcat.generate_signed_url(
+                    expiration=3600,
+                )
+                try:
+                    artifacts["logcat_text"] = best_logcat.download_as_text(
+                        encoding="utf-8",
                     )
+                except Exception:
                     try:
-                        artifacts["logcat_text"] = blob.download_as_text(
-                            encoding="utf-8"
+                        raw = best_logcat.download_as_bytes()
+                        artifacts["logcat_text"] = raw.decode(
+                            "utf-8", errors="replace",
                         )
                     except Exception:
-                        # Fallback: try binary download
-                        try:
-                            raw = blob.download_as_bytes()
-                            artifacts["logcat_text"] = raw.decode(
-                                "utf-8", errors="replace"
-                            )
-                        except Exception:
-                            pass
+                        pass
+
         except Exception:
             pass  # Artifacts are best-effort
 
